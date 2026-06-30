@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram -> Facebook review bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# عدّل المستخدم والمسار حسب جهازك
+User=pi
+WorkingDirectory=/home/pi/Facebook-telegram
+ExecStart=/home/pi/Facebook-telegram/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
