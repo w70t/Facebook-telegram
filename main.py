@@ -13,12 +13,14 @@ import secrets
 import subprocess
 import sys
 
+import requests
 from telethon import Button, TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 from telethon.utils import get_peer_id
 
 from facebook import FacebookPublisher
 from settings import BASE_DIR, Settings
+from twitter import XReader
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -47,6 +49,8 @@ state: dict[int, dict] = {}        # user_id -> {"action": ..., ...}
 source_ids: set[int] = set()
 _counter = 0
 _claim_code = None
+
+xreader = XReader(S)
 
 
 def _new_id() -> str:
@@ -153,7 +157,9 @@ def _panel_markup():
         [Button.inline(f"🔐 تسجيل دخول الحساب {login}", b"m:login")],
         [Button.inline(f"📘 إعداد فيسبوك {fb}", b"m:fb")],
         [Button.inline(f"📍 تعيين قروب المراجعة {rev}", b"m:review")],
-        [Button.inline("📡 القنوات المصدر", b"m:sources")],
+        [Button.inline("📡 قنوات تلغرام المصدر", b"m:sources")],
+        [Button.inline(f"🐦 حساب X (تسجيل دخول) {'✅' if S.x_login_ready() else '❌'}", b"m:xlogin")],
+        [Button.inline("🐦 حسابات X المتابَعة", b"m:xaccounts")],
         [Button.inline("👤 الأدمنون", b"m:admins")],
         [Button.inline("🌍 رمز الدولة الافتراضي", b"m:cc")],
         [Button.inline("🔄 تحديث من GitHub", b"m:update")],
@@ -230,6 +236,13 @@ async def on_menu(event):
         await event.respond("📍 تم تعيين هذه المحادثة كقروب المراجعة ✅")
     elif what == "sources":
         await _show_sources(event)
+    elif what == "xlogin":
+        state[event.sender_id] = {"action": "x_user"}
+        await event.respond(
+            "🐦 تسجيل دخول X (استخدم حساباً ثانوياً).\nأرسل **اسم المستخدم** (بدون @):"
+        )
+    elif what == "xaccounts":
+        await _show_x_accounts(event)
     elif what == "admins":
         await _show_admins(event)
     elif what == "cc":
@@ -274,6 +287,54 @@ async def on_src(event):
         state[event.sender_id] = {"action": "del_source"}
         await event.respond("أرسل @يوزر_القناة أو معرّفها الرقمي لحذفها:")
     await event.answer()
+
+
+# ============ حسابات X ============
+async def _show_x_accounts(event):
+    accs = S.x_accounts()
+    text = "🐦 حسابات X المتابَعة:\n" + (
+        "\n".join(f"• @{a['screen_name']}" for a in accs)
+        if accs else "(لا توجد حسابات بعد)"
+    )
+    await event.respond(
+        text,
+        buttons=[
+            [Button.inline("➕ إضافة حساب", b"xacc:add")],
+            [Button.inline("➖ حذف حساب", b"xacc:del")],
+        ],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^xacc:"))
+async def on_xacc(event):
+    if not S.is_admin(event.sender_id):
+        await event.answer("غير مصرّح لك.", alert=True)
+        return
+    action = event.data.decode().split(":", 1)[1]
+    if action == "add":
+        if not S.x_login_ready():
+            await event.respond("سجّل دخول X أولاً من 🐦 حساب X.")
+        else:
+            state[event.sender_id] = {"action": "x_add"}
+            await event.respond("أرسل @اسم_الحساب المراد متابعته:")
+    elif action == "del":
+        state[event.sender_id] = {"action": "x_del"}
+        await event.respond("أرسل @اسم_الحساب المراد حذفه:")
+    await event.answer()
+
+
+async def _add_x_account(event, raw):
+    name = raw.lstrip("@").strip()
+    try:
+        user_id, _disp = await xreader.resolve(name)
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ تعذّر إيجاد الحساب. تأكد من تسجيل دخول X.\n{e}")
+        return
+    added = S.add_x_account(name, user_id)
+    state.pop(event.sender_id, None)
+    await event.respond(
+        f"✅ أُضيف حساب X: @{name}" if added else f"ℹ️ موجود مسبقاً: @{name}"
+    )
 
 
 # ============ الأدمنون ============
@@ -333,7 +394,8 @@ async def _show_status(event):
         f"• تسجيل الحساب: {'✅ ' + str(S.get('user_phone')) if S.get('user_phone') else '❌'}\n"
         f"• فيسبوك: {'✅' if S.facebook_ready() else '❌'}\n"
         f"• قروب المراجعة: {'✅' if S.get('review_chat_id') else '❌'}\n"
-        f"• عدد القنوات: {len(S.sources())}\n"
+        f"• قنوات تلغرام: {len(S.sources())}\n"
+        f"• تسجيل X: {'✅' if S.x_login_ready() else '❌'} | حسابات X: {len(S.x_accounts())}\n"
         f"• عدد الأدمنين: {len(S.get('admin_ids') or [])}\n"
         f"• رمز الدولة الافتراضي: {S.get('default_cc') or '—'}"
     )
@@ -425,6 +487,36 @@ async def on_text(event):
         _rebuild_ids()
         state.pop(uid, None)
         await event.respond(f"🗑️ حُذف {removed} قناة." if removed else "لم أجد قناة مطابقة.")
+    elif action == "x_user":
+        S.set("x_username", text)
+        state[uid] = {"action": "x_email"}
+        await event.respond("أرسل بريد الحساب الإلكتروني (أو أرسل `-` لتخطّيه):")
+    elif action == "x_email":
+        S.set("x_email", None if text == "-" else text)
+        state[uid] = {"action": "x_pass"}
+        await event.respond("أرسل **كلمة مرور** حساب X:")
+    elif action == "x_pass":
+        S.set("x_password", text)
+        state.pop(uid, None)
+        try:
+            await event.delete()  # حذف رسالة كلمة المرور للخصوصية
+        except Exception:  # noqa: BLE001
+            pass
+        await event.respond("⏳ جاري تسجيل الدخول إلى X…")
+        try:
+            await xreader.login(S.get("x_username"), S.get("x_email"), S.get("x_password"))
+            await event.respond("✅ تم تسجيل الدخول إلى X. أضف الحسابات من 🐦.")
+        except Exception as e:  # noqa: BLE001
+            await event.respond(
+                f"❌ فشل تسجيل الدخول إلى X: {e}\n"
+                "قد يطلب تأكيداً أمنياً؛ سجّل الدخول للحساب من المتصفح مرة ثم أعد المحاولة."
+            )
+    elif action == "x_add":
+        await _add_x_account(event, text)
+    elif action == "x_del":
+        removed = S.remove_x_account(text.lstrip("@"))
+        state.pop(uid, None)
+        await event.respond(f"🗑️ حُذف {removed} حساب." if removed else "لم أجد الحساب.")
     elif action == "add_admin":
         if text.isdigit():
             S.add_admin(int(text))
@@ -538,6 +630,57 @@ async def _add_source(event, raw):
     )
 
 
+# ============ قارئ X: التنزيل والمعالجة والدوران ============
+def _download_url(url, dest_dir):
+    ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
+    path = os.path.join(dest_dir, f"x_{secrets.token_hex(6)}{ext}")
+    with requests.get(url, stream=True, timeout=90) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+    return path
+
+
+async def handle_x_tweet(account, tweet):
+    text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
+    media_path = media_type = None
+    urls = XReader.extract_media_urls(tweet)
+    if urls:
+        url, media_type = urls[0]  # نأخذ أول وسيط
+        try:
+            media_path = await asyncio.to_thread(_download_url, url, S.get("download_dir"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("فشل تنزيل وسيط X: %s", e)
+            media_path = media_type = None
+
+    item_id = _new_id()
+    pending[item_id] = {"text": text, "media_path": media_path, "media_type": media_type}
+    log.info("تغريدة جديدة من @%s (%s)", account["screen_name"], media_type or "نص")
+    try:
+        await _send_for_review(item_id)
+    except Exception as e:  # noqa: BLE001
+        log.error("فشل إرسال التغريدة للمراجعة: %s", e)
+        _cleanup(item_id)
+    S.set_x_last_id(account["screen_name"], str(tweet.id))
+
+
+async def x_poller():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if S.x_accounts() and S.get("review_chat_id") and await xreader.ensure_login():
+                for acc in S.x_accounts():
+                    try:
+                        for tw in await xreader.fetch_new(acc):
+                            await handle_x_tweet(acc, tw)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("قراءة X @%s: %s", acc["screen_name"], e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("دورة X: %s", e)
+        await asyncio.sleep(S.get("x_poll_seconds", 120))
+
+
 # ============ التشغيل ============
 async def main():
     global _claim_code
@@ -558,7 +701,9 @@ async def main():
         log.info("الحساب غير مسجّل — سجّل الدخول من زر 🔐 داخل البوت.")
 
     await asyncio.gather(
-        user.run_until_disconnected(), bot.run_until_disconnected()
+        user.run_until_disconnected(),
+        bot.run_until_disconnected(),
+        x_poller(),
     )
 
 
