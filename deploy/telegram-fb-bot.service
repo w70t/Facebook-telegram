@@ -9,8 +9,9 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/Facebook-telegram
 ExecStart=/home/pi/Facebook-telegram/venv/bin/python main.py
-Restart=on-failure
-RestartSec=10
+# always: يضمن إعادة التشغيل بعد زر "🔄 تحديث من GitHub"
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
