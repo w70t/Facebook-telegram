@@ -1,4 +1,5 @@
 .env
+settings.json
 *.session
 *.session-journal
 sources.json
