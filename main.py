@@ -12,8 +12,10 @@ import logging
 import os
 
 from telethon import Button, TelegramClient, events
+from telethon.utils import get_peer_id
 
 import config
+import sources as sources_store
 from facebook import FacebookPublisher
 
 logging.basicConfig(
@@ -35,6 +37,44 @@ pending: dict[str, dict] = {}
 # الأدمنون الذين هم في وضع "تعديل النص الآن"
 edit_state: dict[int, str] = {}
 _counter = 0
+
+# القنوات المصدر (تُدار من داخل البوت وتُحفظ في sources.json)
+source_entries: list[dict] = []
+source_ids: set[int] = set()
+
+
+def _rebuild_ids():
+    source_ids.clear()
+    source_ids.update(e["id"] for e in source_entries)
+
+
+async def _resolve(identifier):
+    """يحوّل @username / رابط / معرّف إلى (id, العنوان) عبر الحساب الشخصي."""
+    if isinstance(identifier, str) and identifier.lstrip("-").isdigit():
+        identifier = int(identifier)
+    entity = await user.get_entity(identifier)
+    peer_id = get_peer_id(entity)
+    title = (
+        getattr(entity, "title", None)
+        or getattr(entity, "username", None)
+        or str(peer_id)
+    )
+    return peer_id, title
+
+
+async def init_sources():
+    global source_entries
+    source_entries = sources_store.load()
+    # أول تشغيل: انسخ القنوات من .env إن وُجدت
+    if not source_entries and config.SOURCE_CHANNELS:
+        for ch in config.SOURCE_CHANNELS:
+            try:
+                peer_id, title = await _resolve(ch)
+                source_entries.append({"id": peer_id, "title": title, "input": str(ch)})
+            except Exception as e:  # noqa: BLE001
+                log.warning("تعذّر حل القناة %s: %s", ch, e)
+        sources_store.save(source_entries)
+    _rebuild_ids()
 
 
 def _new_id() -> str:
@@ -87,8 +127,10 @@ async def _send_for_review(item_id: str):
 
 
 # ---------- الحساب الشخصي: يقرأ القنوات المصدر ----------
-@user.on(events.NewMessage(chats=config.SOURCE_CHANNELS))
+@user.on(events.NewMessage)
 async def on_source_message(event):
+    if event.chat_id not in source_ids:
+        return
     msg = event.message
     text = msg.message or ""
     media_path = None
@@ -180,9 +222,82 @@ async def cmd_id(event):
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def cmd_start(event):
     await event.respond(
-        "بوت مراجعة المنشورات يعمل ✅\n"
-        "استخدم /id لمعرفة معرّف المحادثة ومعرّفك."
+        "بوت مراجعة المنشورات يعمل ✅\n\n"
+        "الأوامر:\n"
+        "/id — معرّف المحادثة ومعرّفك\n"
+        "/sources — عرض القنوات المصدر\n"
+        "/addsource @قناة — إضافة قناة\n"
+        "/delsource @قناة — حذف قناة"
     )
+
+
+# ---------- إدارة القنوات المصدر من داخل البوت (للأدمنين) ----------
+@bot.on(events.NewMessage(pattern=r"^/sources"))
+async def cmd_sources(event):
+    if event.sender_id not in config.ADMIN_IDS:
+        return
+    if not source_entries:
+        await event.respond("لا توجد قنوات مصدر بعد.\nأضف بـ: /addsource @القناة")
+        return
+    lines = [f"• {e['title']}  (`{e['id']}`)" for e in source_entries]
+    await event.respond("📡 القنوات المصدر:\n" + "\n".join(lines))
+
+
+@bot.on(events.NewMessage(pattern=r"^/addsource(?:@\w+)?(?:\s+(.+))?$"))
+async def cmd_addsource(event):
+    if event.sender_id not in config.ADMIN_IDS:
+        return
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg:
+        await event.respond("الاستخدام: `/addsource @channel`\nأو رابط أو معرّف رقمي.")
+        return
+    try:
+        peer_id, title = await _resolve(arg)
+    except Exception as e:  # noqa: BLE001
+        await event.respond(
+            "❌ تعذّر الوصول للقناة. تأكد أن حسابك الشخصي **عضو فيها**.\n" f"{e}"
+        )
+        return
+    if any(e["id"] == peer_id for e in source_entries):
+        await event.respond(f"ℹ️ القناة مضافة مسبقاً: {title}")
+        return
+    source_entries.append({"id": peer_id, "title": title, "input": arg})
+    sources_store.save(source_entries)
+    _rebuild_ids()
+    await event.respond(f"✅ تمت إضافة: {title}  (`{peer_id}`)")
+
+
+@bot.on(events.NewMessage(pattern=r"^/delsource(?:@\w+)?(?:\s+(.+))?$"))
+async def cmd_delsource(event):
+    if event.sender_id not in config.ADMIN_IDS:
+        return
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg:
+        await event.respond("الاستخدام: `/delsource @channel` أو المعرّف الرقمي.")
+        return
+
+    target_id = None
+    if arg.lstrip("-").isdigit():
+        target_id = int(arg)
+    else:
+        try:
+            target_id, _ = await _resolve(arg)
+        except Exception:  # noqa: BLE001
+            target_id = None
+
+    kept = [
+        e
+        for e in source_entries
+        if not (e["id"] == target_id or e["input"] == arg or e["title"] == arg)
+    ]
+    removed = len(source_entries) - len(kept)
+    if removed:
+        source_entries[:] = kept
+        sources_store.save(source_entries)
+        _rebuild_ids()
+        await event.respond(f"🗑️ تم حذف {removed} قناة. استخدم /sources للعرض.")
+    else:
+        await event.respond("لم أجد قناة مطابقة. استخدم /sources للعرض.")
 
 
 @bot.on(events.NewMessage)
@@ -209,10 +324,12 @@ async def main():
     # أول تشغيل سيطلب رقم الهاتف ورمز التحقق لإنشاء جلسة الحساب الشخصي
     await user.start()
 
+    await init_sources()
+
     me = await user.get_me()
     bot_me = await bot.get_me()
     log.info("الحساب الشخصي: %s | البوت: @%s", me.id, bot_me.username)
-    log.info("يستمع للقنوات: %s", config.SOURCE_CHANNELS)
+    log.info("يستمع لـ %d قناة مصدر", len(source_entries))
 
     await asyncio.gather(
         user.run_until_disconnected(),

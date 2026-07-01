@@ -26,8 +26,11 @@ API_HASH = _require("API_HASH")
 
 BOT_TOKEN = _require("BOT_TOKEN")
 
+# اختياري: يمكن ترك القائمة فارغة وإضافة القنوات من داخل البوت بـ /addsource
 SOURCE_CHANNELS = [
-    _coerce_chat(c) for c in _require("SOURCE_CHANNELS").split(",") if c.strip()
+    _coerce_chat(c)
+    for c in os.environ.get("SOURCE_CHANNELS", "").split(",")
+    if c.strip() and not c.strip().startswith("<")
 ]
 
 REVIEW_CHAT_ID = int(_require("REVIEW_CHAT_ID"))
