@@ -8,6 +8,7 @@
 import asyncio
 import logging
 import os
+import random
 import re
 import secrets
 import subprocess
@@ -768,7 +769,10 @@ async def x_poller():
                 if await xreader.ensure_login():
                     _x_alerted = False
                     active = xreader.active
-                    for acc in S.x_accounts():
+                    for i, acc in enumerate(S.x_accounts()):
+                        # تباعد عشوائي بسيط بين الحسابات (سلوك أقل آلية)
+                        if i:
+                            await asyncio.sleep(random.uniform(3, 10))
                         try:
                             for tw in await xreader.fetch_new(acc):
                                 await handle_x_tweet(acc, tw)
@@ -788,7 +792,9 @@ async def x_poller():
                     )
         except Exception as e:  # noqa: BLE001
             log.warning("دورة X: %s", e)
-        await asyncio.sleep(S.get("x_poll_seconds", 120))
+        # فاصل عشوائي بين الدورات حتى لا يبان الإيقاع ساعةً منتظمة
+        base = S.get("x_poll_seconds", 120)
+        await asyncio.sleep(random.uniform(base * 0.7, base * 1.6))
 
 
 # ============ التشغيل ============
