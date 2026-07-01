@@ -65,6 +65,11 @@ class Settings:
         with self._lock:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
+            # الملف يحتوي أسرارًا (توكن فيسبوك/كلمات مرور X) — اقصر القراءة على المالك
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
 
     # --- وصول عام ---
     def get(self, key, default=None):

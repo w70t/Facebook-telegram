@@ -574,7 +574,7 @@ async def on_text(event):
     elif action == "login_code":
         await _login_code(event, st, text)
     elif action == "login_password":
-        await _login_password(event, text)
+        await _login_password(event, st, text)
     elif action == "set_cc":
         S.set("default_cc", re.sub(r"\D", "", text))
         state.pop(uid, None)
@@ -726,7 +726,7 @@ async def _login_code(event, st, text):
     try:
         await user.sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
     except SessionPasswordNeededError:
-        state[event.sender_id] = {"action": "login_password"}
+        state[event.sender_id] = {"action": "login_password", "phone": st["phone"]}
         await event.respond("🔒 الحساب محمي بكلمة مرور (تحقق بخطوتين). أرسلها الآن:")
         return
     except Exception as e:  # noqa: BLE001
@@ -736,13 +736,13 @@ async def _login_code(event, st, text):
     await _login_done(event, st["phone"])
 
 
-async def _login_password(event, password):
+async def _login_password(event, st, password):
     try:
         await user.sign_in(password=password)
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ كلمة المرور غير صحيحة: {e}")
         return
-    await _login_done(event, S.get("user_phone"))
+    await _login_done(event, st.get("phone") or S.get("user_phone"))
 
 
 async def _login_done(event, phone):
