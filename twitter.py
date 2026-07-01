@@ -1,88 +1,136 @@
 """
 قارئ X (تويتر) غير رسمي عبر مكتبة twikit.
-يسجّل دخول حساب X ثانوي، ويجلب التغريدات الجديدة للحسابات المتابَعة.
+يدعم مجموعة حسابات دخول: لو انحظر حساب يبدّل تلقائياً للي بعده.
 
 ملاحظة: twikit غير رسمية وقد تتغيّر واجهتها؛ الكود مكتوب دفاعياً.
 """
 import logging
 import os
+import re
 
 from settings import BASE_DIR
 
 log = logging.getLogger("tg2fb.x")
 
-COOKIES_FILE = os.path.join(BASE_DIR, "x_cookies.json")
+# كلمات تدل على مشكلة مصادقة/حظر (لتمييزها عن أخطاء الشبكة العابرة)
+AUTH_HINTS = re.compile(
+    r"unauthoriz|401|403|forbidden|suspend|ban|locked|could not authenticate|"
+    r"denied|blocked|not authorized",
+    re.I,
+)
+
+
+def _cookies_path(username):
+    safe = re.sub(r"\W+", "_", username or "x")
+    return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
+
+
+def is_auth_error(exc):
+    return bool(AUTH_HINTS.search(str(exc)))
 
 
 class XReader:
     def __init__(self, settings):
         self.S = settings
         self.client = None
+        self.active = None      # اسم الحساب النشط حالياً
         self.ready = False
 
     def _new_client(self):
-        from twikit import Client  # استيراد كسول حتى لا يفشل المشروع لو غير مثبّت
+        from twikit import Client  # استيراد كسول
 
         return Client("en-US")
 
-    async def login(self, username, email, password):
-        """تسجيل دخول جديد وحفظ الكوكيز."""
-        self.client = self._new_client()
-        await self.client.login(
-            auth_info_1=username, auth_info_2=email or username, password=password
-        )
-        self.client.save_cookies(COOKIES_FILE)
+    def invalidate(self):
+        """يُبطل الجلسة الحالية ليُعاد اختيار حساب نشط."""
+        self.client = None
+        self.active = None
+        self.ready = False
+
+    async def _activate(self, cred):
+        username = cred["username"]
+        client = self._new_client()
+        cpath = _cookies_path(username)
+        if os.path.exists(cpath):
+            client.load_cookies(cpath)
+        else:
+            await client.login(
+                auth_info_1=username,
+                auth_info_2=cred.get("email") or username,
+                password=cred["password"],
+            )
+            client.save_cookies(cpath)
+        self.client = client
+        self.active = username
         self.ready = True
-        log.info("تم تسجيل دخول X: %s", username)
+        log.info("حساب X النشط: %s", username)
 
     async def ensure_login(self):
-        """يضمن جلسة صالحة: كوكيز محفوظة أو بيانات مخزّنة."""
+        """يضمن جلسة صالحة، ويتنقّل بين الحسابات عند فشل الدخول."""
         if self.ready and self.client:
             return True
-        if self.client is None:
-            self.client = self._new_client()
-        if os.path.exists(COOKIES_FILE):
-            self.client.load_cookies(COOKIES_FILE)
-            self.ready = True
-            return True
-        u, e, p = self.S.get("x_username"), self.S.get("x_email"), self.S.get("x_password")
-        if u and p:
-            await self.login(u, e, p)
+        for cred in self.S.x_logins():
+            if cred.get("failed"):
+                continue
+            try:
+                await self._activate(cred)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log.warning("فشل دخول X %s: %s", cred["username"], e)
+                self.S.mark_x_login_failed(cred["username"], True)
+                self.invalidate()
+        return False
+
+    def report_failure(self, exc):
+        """يُستدعى عند خطأ أثناء الجلب: يعلّم الحساب النشط كمحظور إن كان خطأ مصادقة."""
+        if self.active and is_auth_error(exc):
+            self.S.mark_x_login_failed(self.active, True)
+            self.invalidate()
             return True
         return False
 
     async def resolve(self, screen_name):
-        """يحوّل @اسم إلى (user_id, الاسم الظاهر)."""
         await self.ensure_login()
         user = await self.client.get_user_by_screen_name(screen_name.lstrip("@"))
         return str(user.id), getattr(user, "name", screen_name)
 
+    @staticmethod
+    def _is_reply(tweet, own_id=None):
+        """يكتشف إن كانت التغريدة رداً (بأشكال twikit المختلفة)."""
+        for attr in ("in_reply_to", "in_reply_to_status_id", "in_reply_to_user_id"):
+            if getattr(tweet, attr, None):
+                return True
+        text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
+        return text.lstrip().startswith("@")
+
     async def fetch_new(self, account):
-        """يرجّع التغريدات الأحدث من last_id (الأقدم أولاً)."""
         await self.ensure_login()
         tweets = await self.client.get_user_tweets(
             account["user_id"], "Tweets", count=20
         )
+        skip_replies = self.S.get("x_skip_replies", True)
         last_id = account.get("last_id")
         fresh = []
         for tw in tweets:
             tid = str(tw.id)
             if last_id is not None and tid == str(last_id):
                 break
-            # نتجاهل الريتويت لتفادي التكرار
             if getattr(tw, "retweeted_tweet", None) is not None:
-                continue
+                continue  # نتجاهل الريتويت
+            if skip_replies and self._is_reply(tw, account.get("user_id")):
+                continue  # نتجاهل الردود — تغريدات فقط
             fresh.append(tw)
-        fresh.reverse()  # الأقدم أولاً
+        fresh.reverse()
         return fresh
 
     @staticmethod
     def extract_media_urls(tweet):
-        """يرجّع [(url, 'photo'|'video')] بشكل دفاعي لاختلاف نسخ twikit."""
         out = []
         media = getattr(tweet, "media", None) or []
         for m in media:
-            mtype = getattr(m, "type", None) or (m.get("type") if isinstance(m, dict) else None)
+            mtype = getattr(m, "type", None) or (
+                m.get("type") if isinstance(m, dict) else None
+            )
             try:
                 if mtype == "photo":
                     url = getattr(m, "media_url", None) or (
@@ -93,10 +141,7 @@ class XReader:
                 elif mtype in ("video", "animated_gif"):
                     streams = getattr(m, "streams", None)
                     if streams:
-                        best = max(
-                            streams,
-                            key=lambda s: getattr(s, "bitrate", 0) or 0,
-                        )
+                        best = max(streams, key=lambda s: getattr(s, "bitrate", 0) or 0)
                         url = getattr(best, "url", None)
                         if url:
                             out.append((url, "video"))
