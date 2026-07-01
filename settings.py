@@ -26,10 +26,8 @@ DEFAULTS = {
     "sources": [],           # قنوات تلغرام: [{"id","title","input"}]
     "download_dir": "downloads",
     # X (تويتر) — طريقة غير رسمية عبر twikit
-    "x_username": None,
-    "x_email": None,
-    "x_password": None,
-    "x_accounts": [],        # [{"screen_name","user_id","last_id"}]
+    "x_logins": [],          # حسابات الدخول: [{"username","email","password","failed"}]
+    "x_accounts": [],        # الحسابات المتابَعة: [{"screen_name","user_id","last_id"}]
     "x_poll_seconds": 120,
 }
 
@@ -126,12 +124,64 @@ class Settings:
     def facebook_ready(self):
         return bool(self.data.get("fb_page_id") and self.data.get("fb_page_token"))
 
-    # --- حسابات X ---
-    def x_accounts(self):
-        return list(self.data.get("x_accounts") or [])
+    # --- حسابات دخول X (مجموعة، مع تبديل تلقائي عند الحظر) ---
+    def x_logins(self):
+        return list(self.data.get("x_logins") or [])
 
     def x_login_ready(self):
-        return bool(self.data.get("x_username") and self.data.get("x_password"))
+        return any(not lg.get("failed") for lg in self.x_logins())
+
+    def add_x_login(self, username, email, password):
+        """يضيف حساب دخول ويجعله النشط (في المقدمة). يحدّث لو موجوداً."""
+        logins = [lg for lg in self.x_logins() if lg["username"].lower() != username.lower()]
+        logins.insert(0, {
+            "username": username, "email": email, "password": password, "failed": False,
+        })
+        self.data["x_logins"] = logins
+        self.save()
+
+    def remove_x_login(self, username):
+        logins = self.x_logins()
+        kept = [lg for lg in logins if lg["username"].lower() != username.lower()]
+        removed = len(logins) - len(kept)
+        self.data["x_logins"] = kept
+        self.save()
+        return removed
+
+    def active_x_login(self):
+        for lg in self.x_logins():
+            if not lg.get("failed"):
+                return lg
+        return None
+
+    def set_active_x_login(self, username):
+        logins = self.x_logins()
+        chosen = [lg for lg in logins if lg["username"].lower() == username.lower()]
+        if not chosen:
+            return False
+        rest = [lg for lg in logins if lg["username"].lower() != username.lower()]
+        chosen[0]["failed"] = False
+        self.data["x_logins"] = chosen + rest
+        self.save()
+        return True
+
+    def mark_x_login_failed(self, username, failed=True):
+        for lg in self.x_logins():
+            if lg["username"].lower() == username.lower():
+                lg["failed"] = failed
+        self.data["x_logins"] = self.x_logins()
+        self.save()
+
+    def reset_x_failures(self):
+        logins = self.x_logins()
+        for lg in logins:
+            lg["failed"] = False
+        self.data["x_logins"] = logins
+        self.save()
+
+    # --- الحسابات المتابَعة ---
+    def x_accounts(self):
+        return list(self.data.get("x_accounts") or [])
 
     def add_x_account(self, screen_name, user_id):
         accs = self.x_accounts()

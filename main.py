@@ -158,7 +158,7 @@ def _panel_markup():
         [Button.inline(f"📘 إعداد فيسبوك {fb}", b"m:fb")],
         [Button.inline(f"📍 تعيين قروب المراجعة {rev}", b"m:review")],
         [Button.inline("📡 قنوات تلغرام المصدر", b"m:sources")],
-        [Button.inline(f"🐦 حساب X (تسجيل دخول) {'✅' if S.x_login_ready() else '❌'}", b"m:xlogin")],
+        [Button.inline(f"🐦 حسابات دخول X ({len(S.x_logins())}) {'✅' if S.x_login_ready() else '❌'}", b"m:xlogins")],
         [Button.inline("🐦 حسابات X المتابَعة", b"m:xaccounts")],
         [Button.inline("👤 الأدمنون", b"m:admins")],
         [Button.inline("🌍 رمز الدولة الافتراضي", b"m:cc")],
@@ -236,11 +236,8 @@ async def on_menu(event):
         await event.respond("📍 تم تعيين هذه المحادثة كقروب المراجعة ✅")
     elif what == "sources":
         await _show_sources(event)
-    elif what == "xlogin":
-        state[event.sender_id] = {"action": "x_user"}
-        await event.respond(
-            "🐦 تسجيل دخول X (استخدم حساباً ثانوياً).\nأرسل **اسم المستخدم** (بدون @):"
-        )
+    elif what == "xlogins":
+        await _show_x_logins(event)
     elif what == "xaccounts":
         await _show_x_accounts(event)
     elif what == "admins":
@@ -289,7 +286,72 @@ async def on_src(event):
     await event.answer()
 
 
-# ============ حسابات X ============
+# ============ حسابات دخول X (مجموعة مع تبديل) ============
+async def _notify_owner(text):
+    chat = S.get("review_chat_id") or S.get("owner_id")
+    if not chat:
+        return
+    try:
+        await bot.send_message(chat, text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("تعذّر تنبيه المالك: %s", e)
+
+
+async def _show_x_logins(event):
+    logins = S.x_logins()
+    active = S.active_x_login()
+
+    def label(lg):
+        if lg.get("failed"):
+            mark = "🚫"
+        elif active and lg["username"].lower() == active["username"].lower():
+            mark = "⭐"
+        else:
+            mark = "•"
+        return f"{mark} @{lg['username']}"
+
+    text = "🐦 حسابات دخول X:\n" + (
+        "\n".join(label(lg) for lg in logins) if logins else "(لا يوجد)"
+    )
+    text += "\n\n⭐ النشط | 🚫 محظور/فشل\nلو انحظر حساب، أضف غيره وسيبدّل تلقائياً."
+    await event.respond(
+        text,
+        buttons=[
+            [Button.inline("➕ إضافة حساب دخول", b"xlog:add")],
+            [
+                Button.inline("🔁 تبديل النشط", b"xlog:switch"),
+                Button.inline("➖ حذف حساب", b"xlog:del"),
+            ],
+            [Button.inline("♻️ إعادة تفعيل المحظورة", b"xlog:reset")],
+        ],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^xlog:"))
+async def on_xlogin(event):
+    if not S.is_admin(event.sender_id):
+        await event.answer("غير مصرّح لك.", alert=True)
+        return
+    action = event.data.decode().split(":", 1)[1]
+    if action == "add":
+        state[event.sender_id] = {"action": "x_user"}
+        await event.respond(
+            "🐦 استخدم حساب X ثانوياً.\nأرسل **اسم المستخدم** (بدون @):"
+        )
+    elif action == "switch":
+        state[event.sender_id] = {"action": "x_switch"}
+        await event.respond("أرسل @اسم الحساب الذي تريد تفعيله:")
+    elif action == "del":
+        state[event.sender_id] = {"action": "x_login_del"}
+        await event.respond("أرسل @اسم حساب الدخول لحذفه:")
+    elif action == "reset":
+        S.reset_x_failures()
+        xreader.invalidate()
+        await event.respond("♻️ أُعيد تفعيل كل حسابات الدخول.")
+    await event.answer()
+
+
+# ============ حسابات X المتابَعة ============
 async def _show_x_accounts(event):
     accs = S.x_accounts()
     text = "🐦 حسابات X المتابَعة:\n" + (
@@ -395,7 +457,9 @@ async def _show_status(event):
         f"• فيسبوك: {'✅' if S.facebook_ready() else '❌'}\n"
         f"• قروب المراجعة: {'✅' if S.get('review_chat_id') else '❌'}\n"
         f"• قنوات تلغرام: {len(S.sources())}\n"
-        f"• تسجيل X: {'✅' if S.x_login_ready() else '❌'} | حسابات X: {len(S.x_accounts())}\n"
+        f"• حسابات دخول X: {len(S.x_logins())} (النشط: "
+        f"{('@' + xreader.active) if xreader.active else '—'})\n"
+        f"• حسابات X المتابَعة: {len(S.x_accounts())}\n"
         f"• عدد الأدمنين: {len(S.get('admin_ids') or [])}\n"
         f"• رمز الدولة الافتراضي: {S.get('default_cc') or '—'}"
     )
@@ -488,29 +552,56 @@ async def on_text(event):
         state.pop(uid, None)
         await event.respond(f"🗑️ حُذف {removed} قناة." if removed else "لم أجد قناة مطابقة.")
     elif action == "x_user":
-        S.set("x_username", text)
-        state[uid] = {"action": "x_email"}
+        state[uid] = {"action": "x_email", "x_username": text.lstrip("@")}
         await event.respond("أرسل بريد الحساب الإلكتروني (أو أرسل `-` لتخطّيه):")
     elif action == "x_email":
-        S.set("x_email", None if text == "-" else text)
-        state[uid] = {"action": "x_pass"}
+        st["x_email"] = None if text == "-" else text
+        st["action"] = "x_pass"
+        state[uid] = st
         await event.respond("أرسل **كلمة مرور** حساب X:")
     elif action == "x_pass":
-        S.set("x_password", text)
+        username = st.get("x_username")
+        email = st.get("x_email")
         state.pop(uid, None)
         try:
             await event.delete()  # حذف رسالة كلمة المرور للخصوصية
         except Exception:  # noqa: BLE001
             pass
+        S.add_x_login(username, email, text)
+        xreader.invalidate()
         await event.respond("⏳ جاري تسجيل الدخول إلى X…")
         try:
-            await xreader.login(S.get("x_username"), S.get("x_email"), S.get("x_password"))
-            await event.respond("✅ تم تسجيل الدخول إلى X. أضف الحسابات من 🐦.")
+            if await xreader.ensure_login():
+                await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
+            else:
+                await event.respond("❌ تعذّر الدخول بأي حساب. تحقق من البيانات.")
         except Exception as e:  # noqa: BLE001
             await event.respond(
                 f"❌ فشل تسجيل الدخول إلى X: {e}\n"
-                "قد يطلب تأكيداً أمنياً؛ سجّل الدخول للحساب من المتصفح مرة ثم أعد المحاولة."
+                "قد يطلب تأكيداً أمنياً؛ سجّل الدخول من المتصفح مرة ثم أعد المحاولة."
             )
+    elif action == "x_switch":
+        state.pop(uid, None)
+        if S.set_active_x_login(text.lstrip("@")):
+            xreader.invalidate()
+            try:
+                ok = await xreader.ensure_login()
+                await event.respond(
+                    f"✅ الحساب النشط الآن: @{xreader.active}" if ok
+                    else "❌ تعذّر الدخول بهذا الحساب."
+                )
+            except Exception as e:  # noqa: BLE001
+                await event.respond(f"❌ فشل: {e}")
+        else:
+            await event.respond("لم أجد حساب دخول بهذا الاسم.")
+    elif action == "x_login_del":
+        state.pop(uid, None)
+        removed = S.remove_x_login(text.lstrip("@"))
+        if removed:
+            xreader.invalidate()
+        await event.respond(
+            f"🗑️ حُذف {removed} حساب دخول." if removed else "لم أجد الحساب."
+        )
     elif action == "x_add":
         await _add_x_account(event, text)
     elif action == "x_del":
@@ -665,17 +756,36 @@ async def handle_x_tweet(account, tweet):
     S.set_x_last_id(account["screen_name"], str(tweet.id))
 
 
+_x_alerted = False
+
+
 async def x_poller():
+    global _x_alerted
     await asyncio.sleep(5)
     while True:
         try:
-            if S.x_accounts() and S.get("review_chat_id") and await xreader.ensure_login():
-                for acc in S.x_accounts():
-                    try:
-                        for tw in await xreader.fetch_new(acc):
-                            await handle_x_tweet(acc, tw)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("قراءة X @%s: %s", acc["screen_name"], e)
+            if S.x_accounts() and S.get("review_chat_id"):
+                if await xreader.ensure_login():
+                    _x_alerted = False
+                    active = xreader.active
+                    for acc in S.x_accounts():
+                        try:
+                            for tw in await xreader.fetch_new(acc):
+                                await handle_x_tweet(acc, tw)
+                        except Exception as e:  # noqa: BLE001
+                            if xreader.report_failure(e):
+                                await _notify_owner(
+                                    f"⚠️ حساب X @{active} تعذّر (قد يكون محظوراً). "
+                                    "سأجرّب حساباً آخر في الدورة القادمة."
+                                )
+                                break
+                            log.warning("قراءة X @%s: %s", acc["screen_name"], e)
+                elif S.x_logins() and not _x_alerted:
+                    _x_alerted = True
+                    await _notify_owner(
+                        "🚫 كل حسابات دخول X محظورة/فاشلة.\n"
+                        "أضف حساباً جديداً من /panel ← 🐦 حسابات دخول X."
+                    )
         except Exception as e:  # noqa: BLE001
             log.warning("دورة X: %s", e)
         await asyncio.sleep(S.get("x_poll_seconds", 120))
