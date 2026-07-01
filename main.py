@@ -96,6 +96,9 @@ async def on_source_message(event):
 
     msg = event.message
     text = msg.message or ""
+    if S.is_filtered(text):
+        log.info("تجاهل منشور تلغرام (فلتر كلمات)")
+        return
     media_path = None
     media_type = None
     if msg.media:
@@ -161,6 +164,7 @@ def _panel_markup():
         [Button.inline("📡 قنوات تلغرام المصدر", b"m:sources")],
         [Button.inline(f"🐦 حسابات دخول X ({len(S.x_logins())}) {'✅' if S.x_login_ready() else '❌'}", b"m:xlogins")],
         [Button.inline("🐦 حسابات X المتابَعة", b"m:xaccounts")],
+        [Button.inline(f"🚫 فلترة الكلمات ({len(S.filter_words())})", b"m:filter")],
         [Button.inline("👤 الأدمنون", b"m:admins")],
         [Button.inline("🌍 رمز الدولة الافتراضي", b"m:cc")],
         [Button.inline("🔄 تحديث من GitHub", b"m:update")],
@@ -241,6 +245,8 @@ async def on_menu(event):
         await _show_x_logins(event)
     elif what == "xaccounts":
         await _show_x_accounts(event)
+    elif what == "filter":
+        await _show_filter(event)
     elif what == "admins":
         await _show_admins(event)
     elif what == "cc":
@@ -359,11 +365,13 @@ async def _show_x_accounts(event):
         "\n".join(f"• @{a['screen_name']}" for a in accs)
         if accs else "(لا توجد حسابات بعد)"
     )
+    replies = "مُتجاهَلة (تغريدات فقط)" if S.get("x_skip_replies", True) else "مشمولة"
     await event.respond(
         text,
         buttons=[
             [Button.inline("➕ إضافة حساب", b"xacc:add")],
             [Button.inline("➖ حذف حساب", b"xacc:del")],
+            [Button.inline(f"↩️ الردود: {replies}", b"xacc:replies")],
         ],
     )
 
@@ -383,6 +391,10 @@ async def on_xacc(event):
     elif action == "del":
         state[event.sender_id] = {"action": "x_del"}
         await event.respond("أرسل @اسم_الحساب المراد حذفه:")
+    elif action == "replies":
+        S.set("x_skip_replies", not S.get("x_skip_replies", True))
+        st = "تغريدات فقط (تجاهل الردود)" if S.get("x_skip_replies") else "التغريدات والردود"
+        await event.respond(f"↩️ الوضع الآن: {st}")
     await event.answer()
 
 
@@ -398,6 +410,37 @@ async def _add_x_account(event, raw):
     await event.respond(
         f"✅ أُضيف حساب X: @{name}" if added else f"ℹ️ موجود مسبقاً: @{name}"
     )
+
+
+# ============ فلترة الكلمات ============
+async def _show_filter(event):
+    words = S.filter_words()
+    text = "🚫 كلمات الفلترة (أي منشور يحتويها يُتجاهل):\n" + (
+        "\n".join(f"• {w}" for w in words) if words else "(لا توجد كلمات)"
+    )
+    text += "\n\nتُطبّق على منشورات تلغرام و X معاً."
+    await event.respond(
+        text,
+        buttons=[
+            [Button.inline("➕ إضافة كلمة", b"flt:add")],
+            [Button.inline("➖ حذف كلمة", b"flt:del")],
+        ],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^flt:"))
+async def on_flt(event):
+    if not S.is_admin(event.sender_id):
+        await event.answer("غير مصرّح لك.", alert=True)
+        return
+    action = event.data.decode().split(":", 1)[1]
+    if action == "add":
+        state[event.sender_id] = {"action": "add_filter"}
+        await event.respond("أرسل الكلمة/العبارة الممنوعة:")
+    elif action == "del":
+        state[event.sender_id] = {"action": "del_filter"}
+        await event.respond("أرسل الكلمة المراد حذفها:")
+    await event.answer()
 
 
 # ============ الأدمنون ============
@@ -609,6 +652,14 @@ async def on_text(event):
         removed = S.remove_x_account(text.lstrip("@"))
         state.pop(uid, None)
         await event.respond(f"🗑️ حُذف {removed} حساب." if removed else "لم أجد الحساب.")
+    elif action == "add_filter":
+        added = S.add_filter_word(text)
+        state.pop(uid, None)
+        await event.respond(f"✅ أُضيفت الكلمة: {text}" if added else "ℹ️ موجودة مسبقاً.")
+    elif action == "del_filter":
+        removed = S.remove_filter_word(text)
+        state.pop(uid, None)
+        await event.respond(f"🗑️ حُذفت الكلمة." if removed else "لم أجد الكلمة.")
     elif action == "add_admin":
         if text.isdigit():
             S.add_admin(int(text))
@@ -736,6 +787,10 @@ def _download_url(url, dest_dir):
 
 async def handle_x_tweet(account, tweet):
     text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
+    if S.is_filtered(text):
+        log.info("تجاهل تغريدة (فلتر كلمات)")
+        S.set_x_last_id(account["screen_name"], str(tweet.id))
+        return
     media_path = media_type = None
     urls = XReader.extract_media_urls(tweet)
     if urls:

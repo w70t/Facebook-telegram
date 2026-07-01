@@ -94,11 +94,21 @@ class XReader:
         user = await self.client.get_user_by_screen_name(screen_name.lstrip("@"))
         return str(user.id), getattr(user, "name", screen_name)
 
+    @staticmethod
+    def _is_reply(tweet, own_id=None):
+        """يكتشف إن كانت التغريدة رداً (بأشكال twikit المختلفة)."""
+        for attr in ("in_reply_to", "in_reply_to_status_id", "in_reply_to_user_id"):
+            if getattr(tweet, attr, None):
+                return True
+        text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
+        return text.lstrip().startswith("@")
+
     async def fetch_new(self, account):
         await self.ensure_login()
         tweets = await self.client.get_user_tweets(
             account["user_id"], "Tweets", count=20
         )
+        skip_replies = self.S.get("x_skip_replies", True)
         last_id = account.get("last_id")
         fresh = []
         for tw in tweets:
@@ -106,7 +116,9 @@ class XReader:
             if last_id is not None and tid == str(last_id):
                 break
             if getattr(tw, "retweeted_tweet", None) is not None:
-                continue
+                continue  # نتجاهل الريتويت
+            if skip_replies and self._is_reply(tw, account.get("user_id")):
+                continue  # نتجاهل الردود — تغريدات فقط
             fresh.append(tw)
         fresh.reverse()
         return fresh

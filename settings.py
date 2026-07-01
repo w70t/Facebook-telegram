@@ -29,6 +29,8 @@ DEFAULTS = {
     "x_logins": [],          # حسابات الدخول: [{"username","email","password","failed"}]
     "x_accounts": [],        # الحسابات المتابَعة: [{"screen_name","user_id","last_id"}]
     "x_poll_seconds": 120,
+    "x_skip_replies": True,  # X: انسخ التغريدات فقط لا الردود
+    "filter_words": [],      # كلمات ممنوعة: أي منشور يحتويها يُتجاهل
 }
 
 
@@ -119,6 +121,32 @@ class Settings:
         self.data["sources"] = kept
         self.save()
         return removed
+
+    # --- فلترة الكلمات ---
+    def filter_words(self):
+        return list(self.data.get("filter_words") or [])
+
+    def add_filter_word(self, word):
+        word = word.strip()
+        if not word or word.lower() in [w.lower() for w in self.filter_words()]:
+            return False
+        words = self.filter_words()
+        words.append(word)
+        self.data["filter_words"] = words
+        self.save()
+        return True
+
+    def remove_filter_word(self, word):
+        words = self.filter_words()
+        kept = [w for w in words if w.lower() != word.strip().lower()]
+        removed = len(words) - len(kept)
+        self.data["filter_words"] = kept
+        self.save()
+        return removed
+
+    def is_filtered(self, text):
+        low = (text or "").lower()
+        return any(w.lower() in low for w in self.filter_words())
 
     # --- فيسبوك ---
     def facebook_ready(self):
