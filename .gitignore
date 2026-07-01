@@ -3,6 +3,7 @@ settings.json
 *.session
 *.session-journal
 sources.json
+x_cookies.json
 downloads/
 __pycache__/
 *.pyc

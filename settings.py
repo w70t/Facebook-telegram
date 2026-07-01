@@ -23,8 +23,14 @@ DEFAULTS = {
     "fb_page_token": None,
     "default_cc": None,      # رمز الدولة الافتراضي مثل "966"
     "user_phone": None,
-    "sources": [],           # [{"id","title","input"}]
+    "sources": [],           # قنوات تلغرام: [{"id","title","input"}]
     "download_dir": "downloads",
+    # X (تويتر) — طريقة غير رسمية عبر twikit
+    "x_username": None,
+    "x_email": None,
+    "x_password": None,
+    "x_accounts": [],        # [{"screen_name","user_id","last_id"}]
+    "x_poll_seconds": 120,
 }
 
 
@@ -119,3 +125,35 @@ class Settings:
     # --- فيسبوك ---
     def facebook_ready(self):
         return bool(self.data.get("fb_page_id") and self.data.get("fb_page_token"))
+
+    # --- حسابات X ---
+    def x_accounts(self):
+        return list(self.data.get("x_accounts") or [])
+
+    def x_login_ready(self):
+        return bool(self.data.get("x_username") and self.data.get("x_password"))
+
+    def add_x_account(self, screen_name, user_id):
+        accs = self.x_accounts()
+        if any(a["screen_name"].lower() == screen_name.lower() for a in accs):
+            return False
+        accs.append({"screen_name": screen_name, "user_id": user_id, "last_id": None})
+        self.data["x_accounts"] = accs
+        self.save()
+        return True
+
+    def remove_x_account(self, screen_name):
+        accs = self.x_accounts()
+        kept = [a for a in accs if a["screen_name"].lower() != screen_name.lower()]
+        removed = len(accs) - len(kept)
+        self.data["x_accounts"] = kept
+        self.save()
+        return removed
+
+    def set_x_last_id(self, screen_name, last_id):
+        accs = self.x_accounts()
+        for a in accs:
+            if a["screen_name"].lower() == screen_name.lower():
+                a["last_id"] = last_id
+        self.data["x_accounts"] = accs
+        self.save()
