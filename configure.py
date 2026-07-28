@@ -2,7 +2,10 @@
 معالج تشغيل لمرة واحدة: يأخذ القيم الأساسية الثلاث فقط ويحفظها في settings.json.
 كل شيء آخر (رقم الهاتف، فيسبوك، القنوات، الأدمنون) يُضبط لاحقاً من داخل تلغرام.
 
-    python setup.py
+    python configure.py
+
+(كان اسمه setup.py — غُيّر لأن setuptools يعامل setup.py معاملة خاصة، فكان
+ أي `pip install .` يشغّل هذا المعالج التفاعلي بالخطأ.)
 """
 from settings import Settings
 
@@ -27,12 +30,18 @@ def main():
         print("\n❌ لازم تعبّي القيم الثلاث. أعد المحاولة.")
         return
 
-    s.set("api_id", int(api_id))
+    try:
+        api_id = int(api_id)
+    except (TypeError, ValueError):
+        print("\n❌ API_ID لازم يكون رقماً.")
+        return
+
+    s.data["api_id"] = api_id
     s.data["api_hash"] = api_hash
     s.data["bot_token"] = bot_token
     s.save()
 
-    print("\n✅ تم الحفظ في settings.json")
+    print(f"\n✅ تم الحفظ في {s.path} (صلاحيات 600 — قراءة المالك فقط)")
     print("الآن شغّل البوت:  python main.py")
     print("ثم أرسل /start للبوت في تلغرام وأكمل الإعداد من هناك.")
 

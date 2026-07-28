@@ -13,5 +13,15 @@ ExecStart=/home/pi/Facebook-telegram/venv/bin/python main.py
 Restart=always
 RestartSec=5
 
+# تقييد أمني — الملفات تحتوي توكن فيسبوك وكلمات مرور X وجلسات تلغرام
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pi/Facebook-telegram
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
 [Install]
 WantedBy=multi-user.target
