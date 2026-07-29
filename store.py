@@ -17,13 +17,18 @@ from jsonio import atomic_write_json, read_json_resilient
 log = logging.getLogger("tg2fb.store")
 
 PLAYABLE = ("photo", "video")
+MAX_ITEMS = 500          # سقف يمنع قناة مُغرِقة من ملء القرص
+
+# مجلدات لا نكنس فيها أبداً مهما كان الإعداد — حماية من download_dir خاطئ
+_FORBIDDEN_SWEEP = {"/", "/home", "/root", "/etc", "/usr", "/var", "/tmp"}
 
 
 class PendingStore:
-    def __init__(self, path, download_dir, ttl_hours=48):
+    def __init__(self, path, download_dir, ttl_hours=48, max_items=MAX_ITEMS):
         self.path = path
         self.download_dir = download_dir
         self.ttl_hours = ttl_hours
+        self.max_items = max_items
         self.items = {}
         self._load()
 
@@ -42,8 +47,26 @@ class PendingStore:
             log.error("تعذّر حفظ المنشورات المعلّقة: %s", e)
 
     # --- عمليات ---
+    def _enforce_cap(self):
+        """
+        قناة تنشر بغزارة (أو مهاجم في قناة مصدر) كانت تكدّس منشورات بلا حد حتى
+        تمتلئ البطاقة. نُبقي الأحدث لأنه الأقرب للمراجعة، ونحذف الأقدم.
+        """
+        overflow = len(self.items) - self.max_items + 1
+        if overflow <= 0:
+            return 0
+        oldest = sorted(self.items, key=lambda k: self.items[k].get("created", 0))
+        for key in oldest[:overflow]:
+            self._delete_files(self.items.pop(key))
+        log.warning(
+            "تجاوز عدد المنشورات المعلّقة %d — حُذف %d من الأقدم",
+            self.max_items, overflow,
+        )
+        return overflow
+
     def add(self, text, media=None, origin=None):
         """media: [{"path": str, "type": "photo"|"video"|"document"}]"""
+        self._enforce_cap()
         item_id = secrets.token_urlsafe(8)
         while item_id in self.items:                # احتياط نظري
             item_id = secrets.token_urlsafe(8)
@@ -113,6 +136,11 @@ class PendingStore:
         تعطّل أو إيقاف مفاجئ. بدون هذا تمتلئ بطاقة الـ SD بصمت.
         """
         if not os.path.isdir(self.download_dir):
+            return 0
+        # الدالة تحذف ملفات — لا نسمح بتوجيهها إلى مجلد نظام بإعداد خاطئ
+        resolved = os.path.realpath(self.download_dir)
+        if resolved in _FORBIDDEN_SWEEP or resolved == os.path.expanduser("~"):
+            log.error("رُفض تنظيف مجلد غير آمن: %s", resolved)
             return 0
         referenced = {
             os.path.abspath(m["path"])

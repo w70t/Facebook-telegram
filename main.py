@@ -6,15 +6,18 @@
 ثم:             python main.py        وأرسل /start للبوت وأكمل من هناك.
 """
 import asyncio
+import glob
 import hashlib
 import logging
 import os
 import random
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import time
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from telethon import Button, TelegramClient, events
@@ -111,6 +114,44 @@ def _purge_states():
         state.pop(uid, None)
 
 
+_SAFE_EXT = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+# معرّف صفحة فيسبوك رقمي دائماً؛ يُدمج في مسار URL فلا نقبل غيره
+_FB_PAGE_ID = re.compile(r"^\d{1,25}$")
+# روابط وسائط X المشروعة فقط
+X_MEDIA_HOSTS = ("twimg.com", "twitter.com", "x.com")
+# بيانات اعتماد مضمّنة في رابط git (https://user:token@host) — لا تُرسل لتلغرام
+_CRED_IN_URL = re.compile(r"(https?://)[^/\s:@]+(?::[^/\s@]*)?@")
+
+
+def _redact(text):
+    """يحجب أي بيانات اعتماد داخل روابط قبل عرض مخرجات git/pip في المحادثة."""
+    return _CRED_IN_URL.sub(r"\1***@", text or "")
+
+
+def _trusted_media_url(url):
+    parts = urlsplit(url or "")
+    if parts.scheme != "https":
+        return False
+    host = (parts.hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in X_MEDIA_HOSTS)
+
+
+def _harden_state_permissions():
+    """
+    ⚠️ أمان: Telethon ينشئ ملفات الجلسة عبر sqlite بصلاحيات umask الافتراضية
+    (0644) ولا يضبطها أبداً — تحقّقنا من مصدر المكتبة. ملف الجلسة يعادل دخولاً
+    كاملاً لحساب تلغرام، فأي مستخدم آخر على الجهاز يستطيع نسخه وانتحال الحساب.
+    """
+    for pattern in ("*.session", "*.session-journal"):
+        for path in glob.glob(os.path.join(BASE_DIR, pattern)):
+            try:
+                if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+                    os.chmod(path, 0o600)
+                    log.info("ضُبطت صلاحيات %s إلى 600", os.path.basename(path))
+            except OSError as e:
+                log.warning("تعذّر ضبط صلاحيات %s: %s", path, e)
+
+
 def _rebuild_ids():
     source_ids.clear()
     source_ids.update(S.source_ids())
@@ -172,6 +213,35 @@ def _media_kind(msg):
     return None
 
 
+DEFAULT_EXT = {"photo": ".jpg", "video": ".mp4", "document": ".bin"}
+
+
+def _is_inside(path, directory):
+    """هل المسار داخل المجلد فعلاً (بعد حلّ الروابط الرمزية و..)؟"""
+    try:
+        root = os.path.realpath(directory)
+        return os.path.commonpath([os.path.realpath(path), root]) == root
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_media_path(msg, kind):
+    """
+    اسم ملف نولّده نحن داخل مجلد التنزيل.
+
+    ⚠️ أمان: اسم الملف القادم من تلغرام (DocumentAttributeFilename) يتحكّم به
+    **صاحب القناة المصدر** — وأنت تتابع قنوات لا تملكها. لو مُرّر مجلد إلى
+    download_media فإن Telethon قبل 1.42 كان يدمج ذلك الاسم كما هو، فاسم مثل
+    "../../venv/lib/python3.11/site-packages/x.pth" يكتب ملفاً خارج المجلد
+    (وملف .pth داخل الـ venv يعني تنفيذ كود عند أول تشغيل).
+    بتمرير مسار كامل نختاره نحن، لا يُستخدم اسم المُرسِل أصلاً — بأي إصدار.
+    """
+    ext = getattr(getattr(msg, "file", None), "ext", "") or ""
+    if not _SAFE_EXT.match(ext):
+        ext = DEFAULT_EXT.get(kind, ".bin")
+    return os.path.join(DOWNLOAD_DIR, f"tg_{secrets.token_hex(8)}{ext}")
+
+
 async def _download_tg_media(msg):
     """يُرجع {"path","type"} أو None. يتخطّى الملفات الأكبر من الحد المسموح."""
     kind = _media_kind(msg)
@@ -185,11 +255,20 @@ async def _download_tg_media(msg):
         )
         return None
     try:
-        path = await msg.download_media(file=DOWNLOAD_DIR + os.sep)
+        path = await msg.download_media(file=_safe_media_path(msg, kind))
     except Exception as e:  # noqa: BLE001
         log.warning("فشل تنزيل الوسائط: %s", e)
         return None
-    return {"path": path, "type": kind} if path else None
+    if not path:
+        return None
+    if not _is_inside(path, DOWNLOAD_DIR):     # حزام أمان ثانٍ
+        log.error("تنزيل خارج مجلد الوسائط — رُفض: %r", path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return {"path": path, "type": kind}
 
 
 async def _queue_for_review(text, media, origin=""):
@@ -705,7 +784,8 @@ async def _self_update(event):
         await event.respond(f"❌ فشل التحديث: {e}")
         return
 
-    msg = (out.stdout + out.stderr).strip()[:1500] or "(بلا مخرجات)"
+    # المخرجات تُرسل إلى محادثة تلغرام؛ رابط origin قد يحمل توكن وصول مضمّناً
+    msg = _redact((out.stdout + out.stderr).strip())[:1500] or "(بلا مخرجات)"
     if out.returncode != 0:
         await event.respond(
             f"❌ فشل السحب — **لن أعيد التشغيل**:\n```\n{msg}\n```\n"
@@ -727,7 +807,7 @@ async def _self_update(event):
             if pip.returncode != 0:
                 await event.respond(
                     f"⚠️ فشل تثبيت الاعتماديات — لن أعيد التشغيل:\n"
-                    f"```\n{(pip.stdout + pip.stderr).strip()[:1000]}\n```"
+                    f"```\n{_redact((pip.stdout + pip.stderr).strip())[:1000]}\n```"
                 )
                 return
         except Exception as e:  # noqa: BLE001
@@ -840,6 +920,12 @@ async def on_text(event):
     st = _get_state(uid)
     if not st or not event.text or event.text.startswith("/"):
         return
+    # ⚠️ أمان: الصلاحية تُفحص عند فتح المحادثة فقط، فمن أُزيل من الأدمنين بعدها
+    # كان بإمكانه إكمال خطوة معلّقة (تغيير توكن فيسبوك مثلاً). نعيد الفحص هنا.
+    if not S.is_admin(uid):
+        _clear_state(uid)
+        log.warning("أُهملت محادثة إعداد لمستخدم لم يعد أدمن: %s", uid)
+        return
     action = st["action"]
     text = event.text.strip()
 
@@ -854,6 +940,13 @@ async def on_text(event):
         _clear_state(uid)
         await event.respond(f"✅ رمز الدولة الافتراضي: {S.get('default_cc')}")
     elif action == "fb_page_id":
+        # يُدمج في مسار Graph API — لا نقبل إلا أرقاماً
+        if not _FB_PAGE_ID.match(text):
+            await event.respond(
+                "❌ معرّف الصفحة يجب أن يكون أرقاماً فقط (مثل `123456789012345`).\n"
+                "تجده عبر `GET /me/accounts` في Graph Explorer."
+            )
+            return
         S.set("fb_page_id", text)
         _set_state(uid, {"action": "fb_token"})
         await event.respond("الآن أرسل **توكن الصفحة** (FB_PAGE_TOKEN):")
@@ -1079,17 +1172,36 @@ async def _add_source(event, raw):
 
 
 # ============ قارئ X: التنزيل والمعالجة والدوران ============
-_SAFE_EXT = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+def _open_media_stream(url, max_hops=3):
+    """
+    يفتح رابط وسائط X بعد التأكد أنه يشير إلى نطاق موثوق — في كل تحويلة أيضاً.
+
+    ⚠️ أمان (SSRF): الروابط تأتي من ردود twikit وليست من عندنا. بلا تقييد، ردٌّ
+    مُلاعَب (أو تحويلة) يجعل البوت يجلب عناوين داخل الشبكة المحلية للـ Pi.
+    """
+    for _ in range(max_hops):
+        if not _trusted_media_url(url):
+            raise ValueError(f"رابط وسائط غير موثوق: {url[:80]}")
+        resp = requests.get(url, stream=True, timeout=90, allow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            resp.close()
+            if not location:
+                raise ValueError("تحويلة بلا وجهة")
+            url = urljoin(url, location)
+            continue
+        return resp
+    raise ValueError("تجاوز عدد التحويلات المسموح")
 
 
 def _download_url(url, dest_dir, max_bytes=0):
     """ينزّل وسيطاً بحد أقصى للحجم — بدونه فيديو ضخم واحد يملأ بطاقة الـ SD."""
-    ext = os.path.splitext(url.split("?")[0])[1]
+    ext = os.path.splitext(urlsplit(url).path)[1]
     if not _SAFE_EXT.match(ext):      # امتداد من رابط خارجي — لا نثق به كما هو
         ext = ".bin"
-    path = os.path.join(dest_dir, f"x_{secrets.token_hex(6)}{ext}")
+    path = os.path.join(dest_dir, f"x_{secrets.token_hex(8)}{ext}")
     try:
-        with requests.get(url, stream=True, timeout=90) as r:
+        with _open_media_stream(url) as r:
             r.raise_for_status()
             declared = int(r.headers.get("Content-Length") or 0)
             if max_bytes and declared > max_bytes:
@@ -1190,6 +1302,7 @@ async def housekeeping():
             expired = PENDING.purge_expired()
             orphans = PENDING.sweep_orphans()
             _purge_states()
+            _harden_state_permissions()   # الجلسات تُعاد كتابتها أحياناً
             if expired or orphans:
                 log.info("تنظيف: %d منشور منتهٍ، %d ملف يتيم", expired, orphans)
         except Exception as e:  # noqa: BLE001
@@ -1201,6 +1314,7 @@ async def main():
     global _claim_code
     await bot.start(bot_token=S.get("bot_token"))
     await user.connect()
+    _harden_state_permissions()   # ملفات الجلسة تُنشأ الآن — قيّدها فوراً
 
     if S.recovery == "recovered":
         log.warning("تم استرجاع الإعدادات من النسخة الاحتياطية بعد تلف الملف.")

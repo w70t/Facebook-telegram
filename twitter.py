@@ -33,6 +33,21 @@ def _cookies_path(username):
     return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
 
 
+def _touch_private(path):
+    """ينشئ الملف فارغاً بصلاحيات 600 قبل أن تكتب فيه المكتبة."""
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
+    except OSError as e:
+        log.warning("تعذّر تهيئة ملف الكوكيز %s: %s", path, e)
+
+
+def _restrict(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _drop_cookies(username):
     """
     يحذف ملف الكوكيز. بدون هذا كانت الكوكيز المنتهية تُحمّل مجدداً إلى ما لا نهاية
@@ -104,6 +119,7 @@ class XReader:
 
         if os.path.exists(cpath):
             try:
+                _restrict(cpath)          # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
                 client.load_cookies(cpath)
                 await self._verify(client, username)
                 authenticated = True
@@ -118,11 +134,11 @@ class XReader:
                 auth_info_2=cred.get("email") or username,
                 password=cred["password"],
             )
+            # الكوكيز = جلسة دخول X كاملة. ننشئ الملف بصلاحيات مقيّدة *قبل*
+            # الكتابة؛ الاكتفاء بـ chmod بعدها يترك نافذة يكون فيها 0644.
+            _touch_private(cpath)
             client.save_cookies(cpath)
-            try:
-                os.chmod(cpath, 0o600)   # الكوكيز = جلسة دخول كاملة
-            except OSError:
-                pass
+            _restrict(cpath)
 
         self.client = client
         self.active = username
