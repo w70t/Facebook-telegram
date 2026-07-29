@@ -18,14 +18,36 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: تثبيت أدوات الاختبار
-        run: pip install pytest pyflakes requests
+      - name: تثبيت الاعتماديات وأدوات الاختبار
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install pytest pyflakes requests "telethon>=1.42,<2"
 
       - name: فحص الصياغة
         run: python -m pyflakes *.py tests/*.py
 
-      - name: الاختبارات
+      - name: الاختبارات (وحدة + تكامل)
         run: python -m pytest -q
+
+      - name: التأكد أن اختبارات التكامل لم تُتخطَّ
+        run: |
+          python -m pytest tests/test_integration.py -q --collect-only >/dev/null
+          python -m pytest tests/test_integration.py -q 2>&1 | tee /tmp/it.log
+          grep -q "skipped" /tmp/it.log && { echo "❌ تُخطّيت اختبارات التكامل"; exit 1; }
+          echo "✅ اختبارات التكامل عملت فعلاً"
+
+      - name: التأكد أن telethon المثبّت غير مصاب بثغرة المسار
+        run: |
+          python - <<'PY'
+          import telethon, os
+          from telethon.client.downloads import DownloadMethods
+          out = DownloadMethods._get_proper_filename(
+              "downloads", "document", ".bin",
+              possible_names=["../../../../etc/cron.d/pwn"])
+          assert os.path.normpath(out).startswith("downloads"), (
+              f"telethon {telethon.__version__} مصاب بـ path traversal: {out}")
+          print("✅ telethon", telethon.__version__, "سليم")
+          PY
 
       - name: التأكد أن الأسرار مستثناة من git
         run: |
