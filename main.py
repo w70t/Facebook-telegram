@@ -2,26 +2,51 @@
 بوت نسخ ونشر: تلغرام -> مراجعة بالأزرار -> فيسبوك
 كل شيء يُدار من داخل تلغرام (تسجيل الدخول، فيسبوك، القنوات، الأدمنون، التحديث).
 
-شغّل مرة واحدة:  python setup.py      (يحفظ api_id/api_hash/bot_token)
-ثم:             python main.py       وأرسل /start للبوت وأكمل من هناك.
+شغّل مرة واحدة:  python configure.py   (يحفظ api_id/api_hash/bot_token)
+ثم:             python main.py        وأرسل /start للبوت وأكمل من هناك.
 """
 import asyncio
+import glob
+import hashlib
 import logging
 import os
 import random
 import re
 import secrets
+import stat
 import subprocess
 import sys
+import time
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from telethon import Button, TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    FloodWaitError,
+    MessageNotModifiedError,
+    SessionPasswordNeededError,
+)
 from telethon.utils import get_peer_id
 
-from facebook import FacebookPublisher
+from facebook import (
+    MAX_ALBUM_PHOTOS,
+    FacebookAuthError,
+    FacebookError,
+    FacebookPublisher,
+    FacebookUncertainError,
+)
 from settings import BASE_DIR, Settings
+from store import PendingStore
 from twitter import XReader
+from util import (
+    CAPTION_LIMIT,
+    TEXT_LIMIT,
+    human_size,
+    media_summary,
+    normalize_phone,
+    preview,
+    review_body,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -31,33 +56,140 @@ log = logging.getLogger("tg2fb")
 S = Settings()
 
 if not S.bootstrap_ready():
-    print("❌ لم يتم الإعداد الأولي بعد. شغّل أولاً:  python setup.py")
+    print("❌ لم يتم الإعداد الأولي بعد. شغّل أولاً:  python configure.py")
     sys.exit(1)
 
-os.makedirs(S.get("download_dir", "downloads"), exist_ok=True)
+# ملفات الحالة (التنزيلات + المنشورات المعلّقة) تعيش بجوار settings.json
+STATE_DIR = os.path.dirname(os.path.abspath(S.path)) or BASE_DIR
+SESSION_DIR = STATE_DIR
+
+
+def _resolve_download_dir(value, state_dir=STATE_DIR):
+    """يقبل فقط مجلد تنزيل فرعياً حقيقياً داخل مجلد الحالة."""
+    state_root = os.path.normcase(os.path.realpath(os.path.abspath(state_dir)))
+    try:
+        raw = os.fspath(value) if value else "downloads"
+    except TypeError:
+        raw = "downloads"
+    candidate = raw if os.path.isabs(raw) else os.path.join(state_root, raw)
+    candidate = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+    try:
+        managed = (
+            candidate != state_root
+            and os.path.commonpath([state_root, candidate]) == state_root
+        )
+    except ValueError:  # أقراص مختلفة على Windows
+        managed = False
+    if managed:
+        return candidate
+    fallback = os.path.join(state_root, "downloads")
+    log.error(
+        "download_dir خارج مجلد الحالة ورُفض (%r)؛ سيُستخدم %s",
+        value, fallback,
+    )
+    return fallback
+
+
+_download_dir = S.get("download_dir", "downloads")
+DOWNLOAD_DIR = _resolve_download_dir(_download_dir)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def _harden_state_permissions(directory=None):
+    """
+    يقيد جلسات Telethon قبل أي اتصال بالشبكة؛ ملف الجلسة يعادل دخولاً كاملاً
+    لحساب تلغرام ولا يجوز أن يبقى بصلاحيات umask الافتراضية (0644).
+    """
+    directory = directory or SESSION_DIR
+    for pattern in ("*.session", "*.session-journal"):
+        for path in glob.glob(os.path.join(directory, pattern)):
+            try:
+                if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+                    os.chmod(path, 0o600)
+                    log.info("ضُبطت صلاحيات %s إلى 600", os.path.basename(path))
+            except OSError as e:
+                log.warning("تعذّر ضبط صلاحيات %s: %s", path, e)
+
 
 # عميلان على نفس حلقة asyncio: حساب شخصي + بوت
 user = TelegramClient(
-    os.path.join(BASE_DIR, "user_session"), S.get("api_id"), S.get("api_hash")
+    os.path.join(SESSION_DIR, "user_session"), S.get("api_id"), S.get("api_hash")
 )
 bot = TelegramClient(
-    os.path.join(BASE_DIR, "bot_session"), S.get("api_id"), S.get("api_hash")
+    os.path.join(SESSION_DIR, "bot_session"), S.get("api_id"), S.get("api_hash")
+)
+_harden_state_permissions()
+
+# المنشورات المعلّقة تُحفظ على القرص: معرّفات عشوائية تنجو من إعادة التشغيل
+PENDING = PendingStore(
+    os.path.join(STATE_DIR, "pending.json"),
+    DOWNLOAD_DIR,
+    ttl_hours=S.get_int("pending_ttl_hours", 48),
 )
 
-# حالة قيد الانتظار: منشورات للمراجعة + محادثات إدخال جارية
-pending: dict[str, dict] = {}
-state: dict[int, dict] = {}        # user_id -> {"action": ..., ...}
+state: dict[int, dict] = {}        # user_id -> {"action": ..., "ts": ...}
 source_ids: set[int] = set()
-_counter = 0
+# حجز ذري داخل حلقة asyncio: يمنع ضغطتي نشر متزامنتين، ويمنع skip/edit من
+# حذف العنصر أو وسائطه بينما يرفعها طلب نشر جارٍ.
+_publishing: set[str] = set()
+# حزام داخل العملية إذا نجح Facebook ثم تعذّر تثبيت/حذف pending. الحالة الدائمة
+# publish_state أدناه هي الحماية الأساسية عبر إعادة التشغيل.
+_published: set[str] = set()
+STATE_TTL = 600                    # محادثة إعداد مهجورة تنتهي بعد 10 دقائق
+HOUSEKEEPING_SECONDS = 3600
+
+MAX_CLAIM_ATTEMPTS = 5
 _claim_code = None
+_claim_attempts = 0
 
 xreader = XReader(S)
 
 
-def _new_id() -> str:
-    global _counter
-    _counter += 1
-    return str(_counter)
+# ============ حالة محادثات الإعداد (بمهلة) ============
+def _set_state(uid, data):
+    state[uid] = {**data, "ts": time.time()}
+
+
+def _get_state(uid):
+    st = state.get(uid)
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > STATE_TTL:
+        state.pop(uid, None)
+        return None
+    return st
+
+
+def _clear_state(uid):
+    state.pop(uid, None)
+
+
+def _purge_states():
+    cutoff = time.time() - STATE_TTL
+    for uid in [u for u, st in state.items() if st.get("ts", 0) < cutoff]:
+        state.pop(uid, None)
+
+
+_SAFE_EXT = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+# معرّف صفحة فيسبوك رقمي دائماً؛ يُدمج في مسار URL فلا نقبل غيره
+_FB_PAGE_ID = re.compile(r"^\d{1,25}$")
+# روابط وسائط X المشروعة فقط
+X_MEDIA_HOSTS = ("twimg.com", "twitter.com", "x.com")
+# بيانات اعتماد مضمّنة في رابط git (https://user:token@host) — لا تُرسل لتلغرام
+_CRED_IN_URL = re.compile(r"(https?://)[^/\s:@]+(?::[^/\s@]*)?@")
+
+
+def _redact(text):
+    """يحجب أي بيانات اعتماد داخل روابط قبل عرض مخرجات git/pip في المحادثة."""
+    return _CRED_IN_URL.sub(r"\1***@", text or "")
+
+
+def _trusted_media_url(url):
+    parts = urlsplit(url or "")
+    if parts.scheme != "https":
+        return False
+    host = (parts.hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in X_MEDIA_HOSTS)
 
 
 def _rebuild_ids():
@@ -65,11 +197,8 @@ def _rebuild_ids():
     source_ids.update(S.source_ids())
 
 
-def _preview(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return "(بدون نص)"
-    return text if len(text) <= 3500 else text[:3500] + "…"
+def _max_media_bytes():
+    return S.get_int("max_media_mb", 200) * 1024 * 1024
 
 
 async def _resolve(identifier):
@@ -85,43 +214,272 @@ async def _resolve(identifier):
     return peer_id, title
 
 
+# ============ نداءات تلغرام مع احتواء FloodWait ============
+async def _tg_call(fn, *args, **kwargs):
+    """
+    تلغرام يفرض انتظاراً إجبارياً عند كثرة الإرسال. بدون معالجته كانت أي قناة نشطة
+    تُسقط المنشورات صامتةً.
+    """
+    for attempt in range(3):
+        try:
+            return await fn(*args, **kwargs)
+        except FloodWaitError as e:
+            wait = int(getattr(e, "seconds", 5))
+            if wait > 300 or attempt == 2:
+                raise
+            log.warning("FloodWait %ss — أنتظر ثم أعيد المحاولة", wait)
+            await asyncio.sleep(wait + 1)
+    raise RuntimeError("تعذّر إرسال الرسالة بعد عدة محاولات")
+
+
 # ============ استقبال منشورات القنوات المصدر ============
+def _media_kind(msg):
+    """
+    نوع الوسيط. الملفات المرسلة كمستند (image/video mime) تُعامل كصورة/فيديو بدل
+    أن تُسقط بصمت عند النشر.
+    """
+    if getattr(msg, "photo", None):
+        return "photo"
+    if getattr(msg, "video", None) or getattr(msg, "video_note", None) or getattr(msg, "gif", None):
+        return "video"
+    doc = getattr(msg, "document", None)
+    if doc is not None:
+        mime = getattr(doc, "mime_type", "") or ""
+        if mime.startswith("image/"):
+            return "photo"
+        if mime.startswith("video/"):
+            return "video"
+        return "document"
+    return None
+
+
+DEFAULT_EXT = {"photo": ".jpg", "video": ".mp4", "document": ".bin"}
+
+
+def _is_inside(path, directory):
+    """هل المسار داخل المجلد فعلاً (بعد حلّ الروابط الرمزية و..)؟"""
+    try:
+        root = os.path.realpath(directory)
+        return os.path.commonpath([os.path.realpath(path), root]) == root
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_media_path(msg, kind):
+    """
+    اسم ملف نولّده نحن داخل مجلد التنزيل.
+
+    ⚠️ أمان: اسم الملف القادم من تلغرام (DocumentAttributeFilename) يتحكّم به
+    **صاحب القناة المصدر** — وأنت تتابع قنوات لا تملكها. لو مُرّر مجلد إلى
+    download_media فإن Telethon قبل 1.42 كان يدمج ذلك الاسم كما هو، فاسم مثل
+    "../../venv/lib/python3.11/site-packages/x.pth" يكتب ملفاً خارج المجلد
+    (وملف .pth داخل الـ venv يعني تنفيذ كود عند أول تشغيل).
+    بتمرير مسار كامل نختاره نحن، لا يُستخدم اسم المُرسِل أصلاً — بأي إصدار.
+    """
+    ext = getattr(getattr(msg, "file", None), "ext", "") or ""
+    if not _SAFE_EXT.match(ext):
+        ext = DEFAULT_EXT.get(kind, ".bin")
+    return os.path.join(DOWNLOAD_DIR, f"tg_{secrets.token_hex(8)}{ext}")
+
+
+async def _download_tg_media(msg):
+    """يُرجع {"path","type"} أو None. يتخطّى الملفات الأكبر من الحد المسموح."""
+    kind = _media_kind(msg)
+    if not kind:
+        return None
+    max_bytes = _max_media_bytes()
+    size = getattr(getattr(msg, "file", None), "size", None) or 0
+    if max_bytes and size > max_bytes:
+        log.warning(
+            "تخطّي وسيط بحجم %s (الحد %s)", human_size(size), human_size(max_bytes)
+        )
+        return None
+    try:
+        path = await msg.download_media(file=_safe_media_path(msg, kind))
+    except Exception as e:  # noqa: BLE001
+        log.warning("فشل تنزيل الوسائط: %s", e)
+        return None
+    if not path:
+        return None
+    if not _is_inside(path, DOWNLOAD_DIR):     # حزام أمان ثانٍ
+        log.error("تنزيل خارج مجلد الوسائط — رُفض: %r", path)
+        # المسار الخارج عن مجلدنا غير مملوك لنا. قد يكون Telethon (أو بديل
+        # اختباري/مخترق) أعاد مسار ملف موجود، لذلك لا نحذفه أبداً.
+        return None
+    return {"path": path, "type": kind}
+
+
+async def _queue_for_review(text, media, origin="", on_persisted=None):
+    """
+    يضيف منشوراً للمخزن ويرسله للمراجعة. يرجع item_id أو None.
+
+    ``on_persisted`` خطوة متزامنة اختيارية تُنفّذ بعد تثبيت pending وقبل أول
+    إرسال Telegram. يستخدمها X لتثبيت المؤشر بلا نافذة crash تنشئ عنصراً ثانياً.
+    """
+    try:
+        item_id = PENDING.add(text, media, origin)
+    except OSError as e:
+        log.error("فشل حفظ المنشور قبل المراجعة: %s", e)
+        await _notify_owner(
+            "⚠️ وصل منشور جديد لكن تعذّر حفظه على القرص؛ لم يُرسل للمراجعة.\n"
+            f"{e}"
+        )
+        return None
+    if on_persisted is not None:
+        try:
+            on_persisted()
+        except Exception as e:  # noqa: BLE001
+            # لا نحذف العنصر: أصبح outbox دائماً، والدورة التالية ستعثر عليه
+            # عبر origin وتحاول تثبيت المؤشر مجدداً قبل أي إرسال.
+            log.error("حُفظ المنشور لكن تعذّر تثبيت مؤشر مصدره: %s", e)
+            await _notify_owner(
+                "⚠️ حُفظ منشور جديد، لكن تعذّر تثبيت مؤشر مصدره على القرص؛ "
+                "لم يُرسل للمراجعة وسأعيد المحاولة دون إنشاء نسخة أخرى.\n"
+                f"{e}"
+            )
+            return None
+    try:
+        await _send_for_review(item_id)
+        return item_id
+    except Exception as e:  # noqa: BLE001
+        log.error("فشل إرسال المنشور للمراجعة: %s", e)
+        # العنصر صار outbox دائماً؛ لا نحذفه بسبب عطل Telegram مؤقت. سيعيد
+        # startup إرساله عبر _replay_unreviewed ثم يثبت review في pending.json.
+        await _notify_owner(
+            "⚠️ وصل منشور جديد وحُفظ، لكن تعذّر عرضه للمراجعة الآن. "
+            "سأعيد إرساله بعد إعادة التشغيل.\n"
+            f"{e}"
+        )
+        return item_id
+
+
+_X_ORIGIN_RE = re.compile(
+    r"^https://x\.com/([A-Za-z0-9_]{1,15})/status/([0-9]+)$",
+    re.ASCII,
+)
+
+
+def _checkpoint_x_origin(item):
+    """يثبّت مؤشر X المضمّن في origin قبل كشف العنصر في Telegram."""
+    match = _X_ORIGIN_RE.fullmatch(str(item.get("origin") or ""))
+    if not match:
+        return
+    screen_name, last_id = match.groups()
+    # set_x_last_id transactional وidempotent. إن نجح ثم مات التشغيل قبل
+    # الإرسال، تكراره لا يضر؛ وإن فشل يجب أن يبقى review=None.
+    S.set_x_last_id(screen_name, last_id)
+
+
+async def _replay_unreviewed():
+    """يعيد إرسال عناصر حُفظت ثم انقطع التشغيل قبل إنشاء رسالة المراجعة."""
+    if not S.get("review_chat_id"):
+        return 0
+    replayed = 0
+    uncertain = 0
+    cleanup_failed = 0
+    for item_id, item in list(PENDING.items.items()):
+        publish_state = item.get("publish_state")
+        if publish_state == "published":
+            try:
+                PENDING.remove(item_id)
+            except OSError as e:
+                cleanup_failed += 1
+                log.error("تعذّر تنظيف المنشور المنشور %s: %s", item_id, e)
+            continue
+        if publish_state == "publishing":
+            uncertain += 1
+            log.error(
+                "لن أعيد المنشور %s للمراجعة: حالة النشر %s قد تعني أنه وصل "
+                "إلى Facebook قبل انقطاع التشغيل.",
+                item_id, publish_state,
+            )
+            continue
+        if item.get("review"):
+            continue
+        try:
+            _checkpoint_x_origin(item)
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "تعذّر تثبيت مؤشر X قبل استعادة المنشور %s؛ سيبقى في outbox: %s",
+                item_id, e,
+            )
+            continue
+        try:
+            await _send_for_review(item_id)
+        except Exception as e:  # noqa: BLE001
+            # نبقي العنصر على القرص ليُعاد في التشغيل التالي؛ حذفه هنا يحوّل
+            # عطل تلغرام المؤقت إلى فقد دائم للمحتوى.
+            log.error("فشل استعادة المنشور المعلّق %s للمراجعة: %s", item_id, e)
+            continue
+        replayed += 1
+    if replayed:
+        log.info("أُعيد إرسال %d منشور محفوظ للمراجعة", replayed)
+    if uncertain:
+        await _notify_owner(
+            f"⚠️ يوجد {uncertain} منشور بحالة نشر غير محسومة بعد إعادة التشغيل. "
+            "حُظر نشره تلقائياً لمنع التكرار. اضغط زر النشر القديم، ثم اختر "
+            "هل المنشور موجود على Facebook أم لا."
+        )
+    if cleanup_failed:
+        await _notify_owner(
+            f"⚠️ تعذّر تنظيف {cleanup_failed} منشور مؤكد النشر من القرص. "
+            "لن يُعاد نشره، وسأحاول تنظيفه دورياً."
+        )
+    return replayed
+
+
 @user.on(events.NewMessage)
 async def on_source_message(event):
-    if event.chat_id not in source_ids:
+    if event.chat_id not in source_ids or not S.get("review_chat_id"):
         return
-    review_chat = S.get("review_chat_id")
-    if not review_chat:
-        return
+    if event.message.grouped_id:
+        return                      # جزء من ألبوم — يتكفّل به on_source_album
 
     msg = event.message
     text = msg.message or ""
     if S.is_filtered(text):
         log.info("تجاهل منشور تلغرام (فلتر كلمات)")
         return
-    media_path = None
-    media_type = None
+
+    media = []
     if msg.media:
-        media_type = "video" if msg.video else "photo" if msg.photo else "document"
-        try:
-            media_path = await msg.download_media(file=S.get("download_dir") + "/")
-        except Exception as e:  # noqa: BLE001
-            log.warning("فشل تنزيل الوسائط: %s", e)
-            media_path = media_type = None
+        item = await _download_tg_media(msg)
+        if item:
+            media.append(item)
 
-    item_id = _new_id()
-    pending[item_id] = {"text": text, "media_path": media_path, "media_type": media_type}
-    log.info("منشور جديد %s (%s)", item_id, media_type or "نص")
-    try:
-        await _send_for_review(item_id)
-    except Exception as e:  # noqa: BLE001
-        log.error("فشل إرسال المنشور للمراجعة: %s", e)
-        _cleanup(item_id)
+    log.info("منشور جديد من %s (%s)", event.chat_id, media_summary(media) or "نص")
+    await _queue_for_review(text, media)
 
 
+@user.on(events.Album)
+async def on_source_album(event):
+    """
+    ألبوم تلغرام (عدة صور برسالة واحدة) يصل كرسائل منفصلة. بدون هذا المعالج كان
+    كل عنصر يصبح منشوراً مستقلاً على فيسبوك.
+    """
+    if event.chat_id not in source_ids or not S.get("review_chat_id"):
+        return
+
+    text = next((m.message for m in event.messages if m.message), "") or ""
+    if S.is_filtered(text):
+        log.info("تجاهل ألبوم تلغرام (فلتر كلمات)")
+        return
+
+    media = []
+    for msg in event.messages[:MAX_ALBUM_PHOTOS]:
+        item = await _download_tg_media(msg)
+        if item:
+            media.append(item)
+
+    log.info("ألبوم جديد من %s (%s)", event.chat_id, media_summary(media) or "نص")
+    await _queue_for_review(text, media)
+
+
+# ============ عرض المنشور للمراجعة ============
 def _build_buttons(item_id, item):
+    playable = [m for m in item.get("media") or [] if m.get("type") in ("photo", "video")]
     rows = [[Button.inline("✅ نشر", f"pub:{item_id}".encode())]]
-    if item.get("media_path"):
+    if playable:
         rows.append([Button.inline("📄 نشر النص فقط", f"pubtext:{item_id}".encode())])
     rows.append(
         [
@@ -132,24 +490,69 @@ def _build_buttons(item_id, item):
     return rows
 
 
-def _cleanup(item_id):
-    item = pending.pop(item_id, None)
-    if item and item.get("media_path"):
-        try:
-            os.remove(item["media_path"])
-        except OSError:
-            pass
+def _review_header(item):
+    header = "📥 منشور جديد للمراجعة:"
+    summary = media_summary(item.get("media"))
+    if summary:
+        header += f"\n📎 {summary}"
+    if any(m.get("type") == "document" for m in item.get("media") or []):
+        header += " (الملفات لا تُنشر على فيسبوك)"
+    if item.get("origin"):
+        header += f"\n🔗 {item['origin']}"
+    return header
 
 
-async def _send_for_review(item_id):
-    item = pending[item_id]
-    caption = f"📥 منشور جديد للمراجعة:\n\n{_preview(item['text'])}"
-    buttons = _build_buttons(item_id, item)
+async def _send_for_review(item_id, refresh=False):
+    item = PENDING.get(item_id)
     chat = S.get("review_chat_id")
-    if item.get("media_path") and item.get("media_type") in ("photo", "video"):
-        await bot.send_file(chat, item["media_path"], caption=caption, buttons=buttons)
+    if not item or not chat:
+        return
+
+    header = _review_header(item)
+    buttons = _build_buttons(item_id, item)
+    files = PENDING.media_paths(item_id)
+    review = item.get("review") or {}
+
+    # بعد التعديل نحدّث نفس الرسالة بدل ترك رسالة قديمة بأزرار حيّة
+    if refresh and review.get("msg"):
+        limit = CAPTION_LIMIT if review.get("has_media") else TEXT_LIMIT
+        try:
+            await _tg_call(
+                bot.edit_message,
+                review["chat"],
+                review["msg"],
+                review_body(item["text"], header, limit),
+                buttons=buttons,
+            )
+            return
+        except MessageNotModifiedError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("تعذّر تحديث رسالة المراجعة، سأرسل جديدة: %s", e)
+
+    if len(files) > 1:
+        # الألبوم لا يقبل أزراراً في تلغرام — نرسله ثم رسالة تحكّم منفصلة
+        await _tg_call(bot.send_file, chat, files)
+        msg = await _tg_call(
+            bot.send_message, chat,
+            review_body(item["text"], header, TEXT_LIMIT), buttons=buttons,
+        )
+        has_media = False
+    elif len(files) == 1:
+        msg = await _tg_call(
+            bot.send_file, chat, files[0],
+            caption=review_body(item["text"], header, CAPTION_LIMIT),
+            buttons=buttons,
+        )
+        has_media = True
     else:
-        await bot.send_message(chat, caption, buttons=buttons)
+        msg = await _tg_call(
+            bot.send_message, chat,
+            review_body(item["text"], header, TEXT_LIMIT), buttons=buttons,
+        )
+        has_media = False
+
+    PENDING.update(item_id, review={"chat": chat, "msg": msg.id, "has_media": has_media})
 
 
 # ============ لوحة التحكم (الأزرار) ============
@@ -162,7 +565,10 @@ def _panel_markup():
         [Button.inline(f"📘 إعداد فيسبوك {fb}", b"m:fb")],
         [Button.inline(f"📍 تعيين قروب المراجعة {rev}", b"m:review")],
         [Button.inline("📡 قنوات تلغرام المصدر", b"m:sources")],
-        [Button.inline(f"🐦 حسابات دخول X ({len(S.x_logins())}) {'✅' if S.x_login_ready() else '❌'}", b"m:xlogins")],
+        [Button.inline(
+            f"🐦 حسابات دخول X ({len(S.x_logins())}) "
+            f"{'✅' if S.x_login_ready() else '❌'}", b"m:xlogins"
+        )],
         [Button.inline("🐦 حسابات X المتابَعة", b"m:xaccounts")],
         [Button.inline(f"🚫 فلترة الكلمات ({len(S.filter_words())})", b"m:filter")],
         [Button.inline("👤 الأدمنون", b"m:admins")],
@@ -194,18 +600,34 @@ async def cmd_panel(event):
 
 @bot.on(events.NewMessage(pattern=r"^/claim(?:\s+(\S+))?"))
 async def cmd_claim(event):
-    global _claim_code
-    if S.get("owner_id"):
+    """
+    الملكية = كل الأسرار (توكن فيسبوك، كلمات مرور X). رمز من ستة أرقام بلا حد
+    للمحاولات كان قابلاً للتخمين، فصار رمزاً طويلاً مع سقف محاولات.
+    """
+    global _claim_code, _claim_attempts
+    if S.get("owner_id") or not _claim_code:
         return
+    if _claim_attempts >= MAX_CLAIM_ATTEMPTS:
+        await event.respond("🚫 تجاوزت عدد المحاولات. أعد تشغيل البوت لتوليد رمز جديد.")
+        return
+
     code = (event.pattern_match.group(1) or "").strip()
-    if _claim_code and code == _claim_code:
+    if code and secrets.compare_digest(code, _claim_code):
         S.set("owner_id", event.sender_id)
         S.add_admin(event.sender_id)
         _claim_code = None
         await event.respond("✅ أصبحت المالك والأدمن. أرسل /panel للمتابعة.")
         log.info("تم تعيين المالك: %s", event.sender_id)
+        return
+
+    _claim_attempts += 1
+    left = MAX_CLAIM_ATTEMPTS - _claim_attempts
+    log.warning("محاولة /claim فاشلة من %s (المتبقي %d)", event.sender_id, left)
+    if left <= 0:
+        _claim_code = None
+        await event.respond("🚫 تجاوزت عدد المحاولات. أعد تشغيل البوت لتوليد رمز جديد.")
     else:
-        await event.respond("❌ الرمز غير صحيح.")
+        await event.respond(f"❌ الرمز غير صحيح. المحاولات المتبقية: {left}")
 
 
 @bot.on(events.NewMessage(pattern=r"^/id"))
@@ -227,14 +649,14 @@ async def on_menu(event):
                 f"الحساب مسجّل حالياً: {S.get('user_phone')}\n"
                 "لإعادة تسجيل الدخول أرسل الرقم مرة أخرى."
             )
-        state[event.sender_id] = {"action": "login_phone"}
+        _set_state(event.sender_id, {"action": "login_phone"})
         await event.respond(
             "🔐 أرسل رقم هاتف الحساب الشخصي:\n"
             "• مع رمز الدولة: `+9665xxxxxxxx`\n"
             "• أو بدونه وسنضيف الرمز الافتراضي (اضبطه من 🌍 رمز الدولة)."
         )
     elif what == "fb":
-        state[event.sender_id] = {"action": "fb_page_id"}
+        _set_state(event.sender_id, {"action": "fb_page_id"})
         await event.respond("📘 أرسل **معرّف صفحة فيسبوك** (FB_PAGE_ID):")
     elif what == "review":
         S.set("review_chat_id", event.chat_id)
@@ -250,7 +672,7 @@ async def on_menu(event):
     elif what == "admins":
         await _show_admins(event)
     elif what == "cc":
-        state[event.sender_id] = {"action": "set_cc"}
+        _set_state(event.sender_id, {"action": "set_cc"})
         await event.respond("🌍 أرسل رمز الدولة الافتراضي بالأرقام فقط، مثل: `966`")
     elif what == "update":
         await _self_update(event)
@@ -285,10 +707,10 @@ async def on_src(event):
         if not await user.is_user_authorized():
             await event.respond("سجّل دخول الحساب أولاً من 🔐.")
         else:
-            state[event.sender_id] = {"action": "add_source"}
+            _set_state(event.sender_id, {"action": "add_source"})
             await event.respond("أرسل @يوزر_القناة أو رابطها أو معرّفها الرقمي:")
     elif action == "del":
-        state[event.sender_id] = {"action": "del_source"}
+        _set_state(event.sender_id, {"action": "del_source"})
         await event.respond("أرسل @يوزر_القناة أو معرّفها الرقمي لحذفها:")
     await event.answer()
 
@@ -299,7 +721,7 @@ async def _notify_owner(text):
     if not chat:
         return
     try:
-        await bot.send_message(chat, text)
+        await _tg_call(bot.send_message, chat, text)
     except Exception as e:  # noqa: BLE001
         log.warning("تعذّر تنبيه المالك: %s", e)
 
@@ -341,20 +763,23 @@ async def on_xlogin(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
-        state[event.sender_id] = {"action": "x_user"}
+        _set_state(event.sender_id, {"action": "x_user"})
         await event.respond(
             "🐦 استخدم حساب X ثانوياً.\nأرسل **اسم المستخدم** (بدون @):"
         )
     elif action == "switch":
-        state[event.sender_id] = {"action": "x_switch"}
+        _set_state(event.sender_id, {"action": "x_switch"})
         await event.respond("أرسل @اسم الحساب الذي تريد تفعيله:")
     elif action == "del":
-        state[event.sender_id] = {"action": "x_login_del"}
+        _set_state(event.sender_id, {"action": "x_login_del"})
         await event.respond("أرسل @اسم حساب الدخول لحذفه:")
     elif action == "reset":
         S.reset_x_failures()
         xreader.invalidate()
-        await event.respond("♻️ أُعيد تفعيل كل حسابات الدخول.")
+        await event.respond(
+            "♻️ أُعيد تفعيل كل حسابات الدخول.\n"
+            "الكوكيز المنتهية تُحذف تلقائياً ليعاد تسجيل الدخول بكلمة المرور."
+        )
     await event.answer()
 
 
@@ -384,12 +809,12 @@ async def on_xacc(event):
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
         if not S.x_login_ready():
-            await event.respond("سجّل دخول X أولاً من 🐦 حساب X.")
+            await event.respond("سجّل دخول X أولاً من 🐦 حسابات دخول X.")
         else:
-            state[event.sender_id] = {"action": "x_add"}
+            _set_state(event.sender_id, {"action": "x_add"})
             await event.respond("أرسل @اسم_الحساب المراد متابعته:")
     elif action == "del":
-        state[event.sender_id] = {"action": "x_del"}
+        _set_state(event.sender_id, {"action": "x_del"})
         await event.respond("أرسل @اسم_الحساب المراد حذفه:")
     elif action == "replies":
         S.set("x_skip_replies", not S.get("x_skip_replies", True))
@@ -400,15 +825,18 @@ async def on_xacc(event):
 
 async def _add_x_account(event, raw):
     name = raw.lstrip("@").strip()
+    _clear_state(event.sender_id)
     try:
         user_id, _disp = await xreader.resolve(name)
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ تعذّر إيجاد الحساب. تأكد من تسجيل دخول X.\n{e}")
         return
-    added = S.add_x_account(name, user_id)
-    state.pop(event.sender_id, None)
+    # نقطة البداية = أحدث تغريدة الآن، وإلا وصلت آخر 20 تغريدة دفعة واحدة
+    last_id = await xreader.latest_tweet_id(user_id)
+    added = S.add_x_account(name, user_id, last_id)
     await event.respond(
-        f"✅ أُضيف حساب X: @{name}" if added else f"ℹ️ موجود مسبقاً: @{name}"
+        f"✅ أُضيف حساب X: @{name}\nسأنقل التغريدات الجديدة من الآن فصاعداً."
+        if added else f"ℹ️ موجود مسبقاً: @{name}"
     )
 
 
@@ -435,10 +863,10 @@ async def on_flt(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
-        state[event.sender_id] = {"action": "add_filter"}
+        _set_state(event.sender_id, {"action": "add_filter"})
         await event.respond("أرسل الكلمة/العبارة الممنوعة:")
     elif action == "del":
-        state[event.sender_id] = {"action": "del_filter"}
+        _set_state(event.sender_id, {"action": "del_filter"})
         await event.respond("أرسل الكلمة المراد حذفها:")
     await event.answer()
 
@@ -464,27 +892,73 @@ async def on_adm(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
-        state[event.sender_id] = {"action": "add_admin"}
+        _set_state(event.sender_id, {"action": "add_admin"})
         await event.respond("أرسل المعرّف الرقمي للأدمن الجديد (يعرفه بأمر /id):")
     elif action == "del":
-        state[event.sender_id] = {"action": "del_admin"}
+        _set_state(event.sender_id, {"action": "del_admin"})
         await event.respond("أرسل المعرّف الرقمي للأدمن المراد حذفه:")
     await event.answer()
 
 
 # ============ التحديث الذاتي على Raspberry ============
-async def _self_update(event):
-    await event.respond("🔄 جاري السحب من GitHub…")
+def _requirements_fingerprint():
     try:
-        out = subprocess.run(
-            ["git", "-C", BASE_DIR, "pull", "--ff-only"],
-            capture_output=True, text=True, timeout=120,
+        with open(os.path.join(BASE_DIR, "requirements.txt"), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _run(cmd, timeout):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+async def _self_update(event):
+    """
+    يسحب آخر نسخة ثم يعيد التشغيل — لكن فقط عند نجاح السحب فعلاً.
+    كان يعيد التشغيل حتى لو فشل git pull، ولا يثبّت الاعتماديات الجديدة.
+    """
+    await event.respond("🔄 جاري السحب من GitHub…")
+    before = _requirements_fingerprint()
+    try:
+        out = await asyncio.to_thread(
+            _run, ["git", "-C", BASE_DIR, "pull", "--ff-only"], 180
         )
-        msg = (out.stdout + out.stderr).strip()[:1500]
-        await event.respond(f"```\n{msg}\n```\n♻️ إعادة تشغيل البوت…")
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ فشل التحديث: {e}")
         return
+
+    # المخرجات تُرسل إلى محادثة تلغرام؛ رابط origin قد يحمل توكن وصول مضمّناً
+    msg = _redact((out.stdout + out.stderr).strip())[:1500] or "(بلا مخرجات)"
+    if out.returncode != 0:
+        await event.respond(
+            f"❌ فشل السحب — **لن أعيد التشغيل**:\n```\n{msg}\n```\n"
+            "غالباً بسبب تعديلات محلية. جرّب: `git -C . status`"
+        )
+        return
+
+    await event.respond(f"```\n{msg}\n```")
+
+    if _requirements_fingerprint() != before:
+        await event.respond("📦 تغيّرت الاعتماديات — جاري التثبيت…")
+        try:
+            pip = await asyncio.to_thread(
+                _run,
+                [sys.executable, "-m", "pip", "install", "-r",
+                 os.path.join(BASE_DIR, "requirements.txt"), "--quiet"],
+                600,
+            )
+            if pip.returncode != 0:
+                await event.respond(
+                    f"⚠️ فشل تثبيت الاعتماديات — لن أعيد التشغيل:\n"
+                    f"```\n{_redact((pip.stdout + pip.stderr).strip())[:1000]}\n```"
+                )
+                return
+        except Exception as e:  # noqa: BLE001
+            await event.respond(f"⚠️ تعذّر تشغيل pip: {e}\nلن أعيد التشغيل.")
+            return
+
+    await event.respond("♻️ إعادة تشغيل البوت…")
     await asyncio.sleep(1)
     try:
         await bot.disconnect()
@@ -498,73 +972,319 @@ async def _show_status(event):
     await event.respond(
         "ℹ️ الحالة:\n"
         f"• تسجيل الحساب: {'✅ ' + str(S.get('user_phone')) if S.get('user_phone') else '❌'}\n"
-        f"• فيسبوك: {'✅' if S.facebook_ready() else '❌'}\n"
+        f"• فيسبوك: {'✅' if S.facebook_ready() else '❌'} (Graph {S.get('fb_api_version')})\n"
         f"• قروب المراجعة: {'✅' if S.get('review_chat_id') else '❌'}\n"
         f"• قنوات تلغرام: {len(S.sources())}\n"
         f"• حسابات دخول X: {len(S.x_logins())} (النشط: "
         f"{('@' + xreader.active) if xreader.active else '—'})\n"
         f"• حسابات X المتابَعة: {len(S.x_accounts())}\n"
+        f"• منشورات بانتظار المراجعة: {len(PENDING.items)}\n"
         f"• عدد الأدمنين: {len(S.get('admin_ids') or [])}\n"
         f"• رمز الدولة الافتراضي: {S.get('default_cc') or '—'}"
     )
 
 
 # ============ نشر المنشورات ============
+def _publish_resolution_buttons(item_id):
+    """أزرار حسم نتيجة POST غير المعروفة؛ callback_data يجب ألا يتجاوز 64 بايت."""
+    return [
+        [Button.inline(
+            "✅ موجود على Facebook — إغلاق",
+            f"pubfix:close:{item_id}".encode(),
+        )],
+        [Button.inline(
+            "↩️ غير موجود — السماح بالمحاولة",
+            f"pubfix:retry:{item_id}".encode(),
+        )],
+    ]
+
+
+async def _show_publish_resolution(event, item_id, detail=""):
+    text = (
+        "⚠️ نتيجة النشر غير محسومة. قد يكون Facebook استلم المنشور رغم تعذّر "
+        "استلام الرد. افحص الصفحة يدوياً ثم اختر:"
+    )
+    if detail:
+        text += f"\n\n{detail}"
+    await event.respond(text, buttons=_publish_resolution_buttons(item_id))
+
+
+async def _cleanup_confirmed_publish(event, item_id):
+    """يحاول حذف سجل مؤكد النشر فقط؛ لا يتصل بـFacebook إطلاقاً."""
+    try:
+        removed = PENDING.remove(item_id)
+    except OSError as e:
+        log.error("تعذّر تنظيف المنشور المؤكد %s: %s", item_id, e)
+        await event.respond(
+            f"⚠️ المنشور مؤكد النشر ولن يُنشر مجدداً، لكن تعذّر تنظيف سجله:\n{e}"
+        )
+        return False
+    _published.discard(item_id)
+    if not removed:
+        await event.answer("✅ المنشور منشور ومنظّف مسبقاً.", alert=True)
+        return True
+    try:
+        await event.edit("✅ تم تأكيد وجود المنشور على Facebook وإغلاق الطلب.")
+    except Exception as e:  # noqa: BLE001
+        log.warning("نُظّف المنشور %s لكن تعذّر تحديث رسالة المراجعة: %s", item_id, e)
+    return True
+
+
+def _publish_block_message(item_id, item=None):
+    """سبب منع إجراء قد يعيد نشر عنصر وصل/قد يكون وصل إلى Facebook."""
+    if item_id in _published:
+        return "✅ نُشر هذا المنشور بالفعل؛ لن أعيد نشره."
+    if item_id in _publishing:
+        return "⏳ هذا المنشور قيد النشر بالفعل."
+    publish_state = (item or {}).get("publish_state")
+    if publish_state == "published":
+        return "✅ نُشر هذا المنشور بالفعل؛ لن أعيد نشره."
+    if publish_state == "publishing":
+        return (
+            "⚠️ حالة النشر غير محسومة بعد انقطاع سابق. "
+            "راجع صفحة Facebook يدوياً لمنع منشور مكرر."
+        )
+    return None
+
+
 @bot.on(events.CallbackQuery(pattern=rb"^(pub|pubtext|edit|skip):"))
 async def on_post_action(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
     action, _, item_id = event.data.decode().partition(":")
-    item = pending.get(item_id)
+    item = PENDING.get(item_id)
+    if item_id in _published or (item or {}).get("publish_state") == "published":
+        await _cleanup_confirmed_publish(event, item_id)
+        return
+    if item_id not in _publishing and (item or {}).get("publish_state") == "publishing":
+        await _show_publish_resolution(event, item_id)
+        await event.answer()
+        return
+    blocked = _publish_block_message(item_id, item)
+    if blocked:
+        await event.answer(blocked, alert=True)
+        return
     if not item:
         await event.answer("انتهت صلاحية هذا المنشور.", alert=True)
         return
 
     if action == "edit":
-        state[event.sender_id] = {"action": "edit_text", "item_id": item_id}
+        _set_state(event.sender_id, {"action": "edit_text", "item_id": item_id})
         await event.respond("✏️ أرسل الآن النص الجديد.")
         await event.answer()
     elif action == "skip":
-        _cleanup(item_id)
+        PENDING.remove(item_id)
         await event.edit("🚫 تم التجاهل.")
     else:
         await _publish(event, item_id, include_media=(action == "pub"))
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pubfix:"))
+async def on_publish_resolution(event):
+    """حسم يدوي لحالة publishing؛ كلا الخيارين يغيّر التخزين فقط بلا POST."""
+    if not S.is_admin(event.sender_id):
+        await event.answer("غير مصرّح لك.", alert=True)
+        return
+    try:
+        _prefix, action, item_id = event.data.decode().split(":", 2)
+    except ValueError:
+        await event.answer("طلب غير صالح.", alert=True)
+        return
+
+    item = PENDING.get(item_id)
+    if not item:
+        await event.answer("المنشور لم يعد متاحاً.", alert=True)
+        return
+    if item_id in _publishing:
+        await event.answer("⏳ طلب النشر ما زال جارياً؛ انتظر نتيجته.", alert=True)
+        return
+
+    if action == "close":
+        if item.get("publish_state") not in ("publishing", "published"):
+            await event.answer("هذا المنشور ليس بحالة غير محسومة.", alert=True)
+            return
+        await _cleanup_confirmed_publish(event, item_id)
+        return
+
+    if action == "retry":
+        if item.get("publish_state") != "publishing":
+            await event.answer("هذا المنشور ليس بحالة غير محسومة.", alert=True)
+            return
+        try:
+            updated = PENDING.update(
+                item_id,
+                publish_state=None,
+                publishing_at=None,
+                published_at=None,
+            )
+        except OSError as e:
+            await event.respond(f"❌ تعذّر حفظ قرار السماح بالمحاولة:\n{e}")
+            return
+        if not updated:
+            await event.answer("المنشور لم يعد متاحاً.", alert=True)
+            return
+        _published.discard(item_id)
+        try:
+            await event.edit(
+                "↩️ تم تأكيد أن المنشور غير موجود على Facebook. "
+                "يمكنك الآن الضغط على زر النشر الأصلي للمحاولة مجدداً."
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("فُتح المنشور %s للمحاولة لكن تعذّر تعديل الرسالة: %s", item_id, e)
+        return
+
+    await event.answer("طلب غير صالح.", alert=True)
 
 
 async def _publish(event, item_id, include_media):
     if not S.facebook_ready():
         await event.answer("أعدّ فيسبوك أولاً من /panel.", alert=True)
         return
-    item = pending.get(item_id)
+    item = PENDING.get(item_id)
+    blocked = _publish_block_message(item_id, item)
+    if blocked:
+        await event.answer(blocked, alert=True)
+        return
     if not item:
         await event.answer("المنشور لم يعد متاحاً.", alert=True)
         return
 
-    await event.answer("⏳ جاري النشر…")
-    fb = FacebookPublisher(S.get("fb_page_id"), S.get("fb_page_token"))
-    text, path, mtype = item["text"], item.get("media_path"), item.get("media_type")
-    try:
-        if include_media and path and mtype == "photo":
-            await asyncio.to_thread(fb.post_photo, path, text)
-        elif include_media and path and mtype == "video":
-            await asyncio.to_thread(fb.post_video, path, text)
-        else:
-            await asyncio.to_thread(fb.post_text, text)
-    except Exception as e:  # noqa: BLE001
-        log.error("فشل النشر %s: %s", item_id, e)
-        await event.respond(f"❌ فشل النشر على فيسبوك:\n{e}")
+    text = item["text"]
+    photos = PENDING.media_paths(item_id, ("photo",))
+    videos = PENDING.media_paths(item_id, ("video",))
+    if not text.strip() and not (include_media and (photos or videos)):
+        await event.answer("لا يوجد نص ولا وسائط للنشر.", alert=True)
         return
-    await event.edit(f"✅ تم النشر على فيسبوك.\n\n{_preview(text)}")
-    _cleanup(item_id)
+
+    _publishing.add(item_id)
+    try:
+        # يجب أن يسبق الحجز الدائم أول await: وإلا تستطيع ضغطة ثانية الدخول بين
+        # الحجز في الذاكرة وحفظه، أو يموت التشغيل بلا أثر دائم للحالة.
+        try:
+            updated = PENDING.update(
+                item_id, publish_state="publishing", publishing_at=time.time()
+            )
+        except OSError as e:
+            log.error("تعذّر تثبيت حجز النشر %s: %s", item_id, e)
+            await event.respond(
+                f"❌ تعذّر حفظ حالة النشر على القرص؛ لم أتصل بفيسبوك.\n{e}"
+            )
+            return
+        if not updated:
+            await event.answer("المنشور لم يعد متاحاً.", alert=True)
+            return
+
+        await event.answer("⏳ جاري النشر…")
+        fb = FacebookPublisher(
+            S.get("fb_page_id"), S.get("fb_page_token"),
+            version=S.get("fb_api_version"),
+        )
+        note = ""
+        try:
+            if include_media and videos:
+                if len(videos) > 1 or photos:
+                    note = "\nℹ️ فيسبوك يقبل فيديو واحداً لكل منشور — نُشر الأول فقط."
+                await asyncio.to_thread(fb.post_video, videos[0], text)
+            elif include_media and photos:
+                if len(photos) > MAX_ALBUM_PHOTOS:
+                    note = f"\nℹ️ نُشرت أول {MAX_ALBUM_PHOTOS} صور فقط."
+                await asyncio.to_thread(fb.post_photos, photos, text)
+            else:
+                await asyncio.to_thread(fb.post_text, text)
+        except FacebookUncertainError as e:
+            log.error("نتيجة نشر فيسبوك غير محسومة %s: %s", item_id, e)
+            # لا نمسح publish_state: الحجز الدائم يمنع أي retry إلى أن يحسم
+            # الأدمن وجود المنشور عبر زري القرار، وكلاهما بلا اتصال بـFacebook.
+            await _show_publish_resolution(event, item_id, str(e))
+            await _notify_owner(
+                "⚠️ نتيجة نشر على Facebook غير محسومة. افحص الصفحة ثم استخدم "
+                "زري الحسم في رسالة المراجعة؛ لن أعيد POST تلقائياً."
+            )
+            return
+        except FacebookAuthError as e:
+            log.error("مشكلة مصادقة فيسبوك %s: %s", item_id, e)
+            try:
+                reopened = PENDING.update(
+                    item_id, publish_state=None, publishing_at=None
+                )
+            except OSError as save_error:
+                log.error("تعذّر إعادة فتح المنشور %s: %s", item_id, save_error)
+                reopened = None
+            if not reopened:
+                await _show_publish_resolution(
+                    event, item_id,
+                    "فشل الطلب قطعاً، لكن تعذّر حفظ إعادة فتحه على القرص.",
+                )
+            await event.respond(
+                f"🔑 مشكلة في توكن فيسبوك:\n{e}\n\n"
+                "المنشور محفوظ — أعِد ضبط 📘 فيسبوك من /panel ثم اضغط نشر مجدداً."
+            )
+            await _notify_owner("🔑 توكن فيسبوك لم يعد صالحاً — النشر متوقف حتى تحديثه.")
+            return
+        except (FacebookError, OSError) as e:
+            log.error("فشل النشر %s: %s", item_id, e)
+            try:
+                reopened = PENDING.update(
+                    item_id, publish_state=None, publishing_at=None
+                )
+            except OSError as save_error:
+                log.error("تعذّر إعادة فتح المنشور %s: %s", item_id, save_error)
+                reopened = None
+            if not reopened:
+                await _show_publish_resolution(
+                    event, item_id,
+                    "فشل الطلب قطعاً، لكن تعذّر حفظ إعادة فتحه على القرص.",
+                )
+            await event.respond(
+                f"❌ فشل النشر على فيسبوك:\n{e}\nالمنشور محفوظ، جرّب مجدداً."
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            # استثناء غير مصنّف قد يقع بعد إرسال الطلب؛ السياسة المحافظة تمنع
+            # إعادة POST حتى يحسم الأدمن النتيجة يدوياً.
+            log.exception("استثناء غير محسوم أثناء نشر %s", item_id)
+            await _show_publish_resolution(event, item_id, str(e))
+            return
+
+        # Facebook نجح: الحماية داخل العملية تسبق أي I/O محلي. ثم نثبت published
+        # على القرص قبل محاولة الحذف؛ حتى لو فشل الحذف يبقى الزر محظوراً بعد restart.
+        _published.add(item_id)
+        try:
+            PENDING.update(
+                item_id, publish_state="published", published_at=time.time()
+            )
+        except OSError as e:
+            # publish_state="publishing" ثُبّت قبل الشبكة، ولذلك يبقى guard دائم
+            # ومحافظ حتى إن فشل تحديثه إلى published.
+            log.error("نُشر %s لكن تعذّر تثبيت حالة النجاح: %s", item_id, e)
+        try:
+            PENDING.remove(item_id)
+        except OSError as e:
+            log.error("نُشر %s لكن تعذّر حذف pending: %s", item_id, e)
+        else:
+            if PENDING.get(item_id) is None:
+                _published.discard(item_id)
+        try:
+            await event.edit(f"✅ تم النشر على فيسبوك.{note}\n\n{preview(text, 800)}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("نُشر %s لكن تعذّر تحديث رسالة المراجعة: %s", item_id, e)
+    finally:
+        _publishing.discard(item_id)
 
 
 # ============ موجّه الإدخالات النصية (محادثات الإعداد) ============
 @bot.on(events.NewMessage)
 async def on_text(event):
     uid = event.sender_id
-    st = state.get(uid)
+    st = _get_state(uid)
     if not st or not event.text or event.text.startswith("/"):
+        return
+    # ⚠️ أمان: الصلاحية تُفحص عند فتح المحادثة فقط، فمن أُزيل من الأدمنين بعدها
+    # كان بإمكانه إكمال خطوة معلّقة (تغيير توكن فيسبوك مثلاً). نعيد الفحص هنا.
+    if not S.is_admin(uid):
+        _clear_state(uid)
+        log.warning("أُهملت محادثة إعداد لمستخدم لم يعد أدمن: %s", uid)
         return
     action = st["action"]
     text = event.text.strip()
@@ -577,69 +1297,45 @@ async def on_text(event):
         await _login_password(event, st, text)
     elif action == "set_cc":
         S.set("default_cc", re.sub(r"\D", "", text))
-        state.pop(uid, None)
+        _clear_state(uid)
         await event.respond(f"✅ رمز الدولة الافتراضي: {S.get('default_cc')}")
     elif action == "fb_page_id":
+        # يُدمج في مسار Graph API — لا نقبل إلا أرقاماً
+        if not _FB_PAGE_ID.match(text):
+            await event.respond(
+                "❌ معرّف الصفحة يجب أن يكون أرقاماً فقط (مثل `123456789012345`).\n"
+                "تجده عبر `GET /me/accounts` في Graph Explorer."
+            )
+            return
         S.set("fb_page_id", text)
-        state[uid] = {"action": "fb_token"}
+        _set_state(uid, {"action": "fb_token"})
         await event.respond("الآن أرسل **توكن الصفحة** (FB_PAGE_TOKEN):")
     elif action == "fb_token":
-        S.set("fb_page_token", text)
-        state.pop(uid, None)
-        await event.respond("✅ تم حفظ إعداد فيسبوك.")
+        await _save_fb_token(event, text)
     elif action == "add_source":
         await _add_source(event, text)
     elif action == "del_source":
         rid = int(text) if text.lstrip("-").isdigit() else None
         removed = S.remove_source(peer_id=rid, raw=text)
         _rebuild_ids()
-        state.pop(uid, None)
+        _clear_state(uid)
         await event.respond(f"🗑️ حُذف {removed} قناة." if removed else "لم أجد قناة مطابقة.")
     elif action == "x_user":
-        state[uid] = {"action": "x_email", "x_username": text.lstrip("@")}
+        _set_state(uid, {"action": "x_email", "x_username": text.lstrip("@")})
         await event.respond("أرسل بريد الحساب الإلكتروني (أو أرسل `-` لتخطّيه):")
     elif action == "x_email":
-        st["x_email"] = None if text == "-" else text
-        st["action"] = "x_pass"
-        state[uid] = st
+        _set_state(uid, {
+            "action": "x_pass",
+            "x_username": st.get("x_username"),
+            "x_email": None if text == "-" else text,
+        })
         await event.respond("أرسل **كلمة مرور** حساب X:")
     elif action == "x_pass":
-        username = st.get("x_username")
-        email = st.get("x_email")
-        state.pop(uid, None)
-        try:
-            await event.delete()  # حذف رسالة كلمة المرور للخصوصية
-        except Exception:  # noqa: BLE001
-            pass
-        S.add_x_login(username, email, text)
-        xreader.invalidate()
-        await event.respond("⏳ جاري تسجيل الدخول إلى X…")
-        try:
-            if await xreader.ensure_login():
-                await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
-            else:
-                await event.respond("❌ تعذّر الدخول بأي حساب. تحقق من البيانات.")
-        except Exception as e:  # noqa: BLE001
-            await event.respond(
-                f"❌ فشل تسجيل الدخول إلى X: {e}\n"
-                "قد يطلب تأكيداً أمنياً؛ سجّل الدخول من المتصفح مرة ثم أعد المحاولة."
-            )
+        await _save_x_login(event, st, text)
     elif action == "x_switch":
-        state.pop(uid, None)
-        if S.set_active_x_login(text.lstrip("@")):
-            xreader.invalidate()
-            try:
-                ok = await xreader.ensure_login()
-                await event.respond(
-                    f"✅ الحساب النشط الآن: @{xreader.active}" if ok
-                    else "❌ تعذّر الدخول بهذا الحساب."
-                )
-            except Exception as e:  # noqa: BLE001
-                await event.respond(f"❌ فشل: {e}")
-        else:
-            await event.respond("لم أجد حساب دخول بهذا الاسم.")
+        await _switch_x_login(event, text)
     elif action == "x_login_del":
-        state.pop(uid, None)
+        _clear_state(uid)
         removed = S.remove_x_login(text.lstrip("@"))
         if removed:
             xreader.invalidate()
@@ -650,55 +1346,115 @@ async def on_text(event):
         await _add_x_account(event, text)
     elif action == "x_del":
         removed = S.remove_x_account(text.lstrip("@"))
-        state.pop(uid, None)
+        _clear_state(uid)
         await event.respond(f"🗑️ حُذف {removed} حساب." if removed else "لم أجد الحساب.")
     elif action == "add_filter":
         added = S.add_filter_word(text)
-        state.pop(uid, None)
+        _clear_state(uid)
         await event.respond(f"✅ أُضيفت الكلمة: {text}" if added else "ℹ️ موجودة مسبقاً.")
     elif action == "del_filter":
         removed = S.remove_filter_word(text)
-        state.pop(uid, None)
-        await event.respond(f"🗑️ حُذفت الكلمة." if removed else "لم أجد الكلمة.")
+        _clear_state(uid)
+        await event.respond("🗑️ حُذفت الكلمة." if removed else "لم أجد الكلمة.")
     elif action == "add_admin":
         if text.isdigit():
             S.add_admin(int(text))
             await event.respond(f"✅ أضيف الأدمن `{text}`")
         else:
             await event.respond("أرسل معرّفاً رقمياً صحيحاً.")
-        state.pop(uid, None)
+        _clear_state(uid)
     elif action == "del_admin":
         if text.isdigit():
             S.remove_admin(int(text))
             await event.respond(f"🗑️ حُذف الأدمن `{text}`")
         else:
             await event.respond("أرسل معرّفاً رقمياً صحيحاً.")
-        state.pop(uid, None)
+        _clear_state(uid)
     elif action == "edit_text":
-        item = pending.get(st["item_id"])
-        state.pop(uid, None)
-        if not item:
-            await event.respond("المنشور لم يعد متاحاً.")
-            return
-        item["text"] = event.text
-        await event.respond("✅ تم تحديث النص. المعاينة الجديدة:")
-        await _send_for_review(st["item_id"])
+        await _apply_edit(event, st)
 
 
-def _normalize_phone(raw):
-    raw = raw.strip().replace(" ", "")
-    if raw.startswith("+"):
-        return raw
-    if raw.startswith("00"):
-        return "+" + raw[2:]
-    cc = S.get("default_cc")
-    if cc:
-        return "+" + cc + raw.lstrip("0")
-    return None  # يحتاج رمز الدولة
+async def _save_fb_token(event, token):
+    _clear_state(event.sender_id)
+    S.set("fb_page_token", token)
+    fb = FacebookPublisher(
+        S.get("fb_page_id"), token, version=S.get("fb_api_version")
+    )
+    try:
+        info = await asyncio.to_thread(fb.check_token)
+    except FacebookAuthError as e:
+        await event.respond(
+            f"⚠️ حُفظ التوكن لكنه لا يعمل:\n{e}\n\n"
+            "تذكّر: توكن Graph Explorer صالح ~ساعة فقط — بدّله بتوكن طويل الأجل "
+            "(انظر SETUP_AR.md)."
+        )
+        return
+    except FacebookError as e:
+        await event.respond(f"⚠️ حُفظ التوكن لكن تعذّر التحقق الآن: {e}")
+        return
+    await event.respond(
+        f"✅ تم حفظ إعداد فيسبوك والتحقق منه.\nالصفحة: {info.get('name', '؟')}"
+    )
 
 
+async def _save_x_login(event, st, password):
+    username = st.get("x_username")
+    email = st.get("x_email")
+    _clear_state(event.sender_id)
+    try:
+        await event.delete()  # حذف رسالة كلمة المرور للخصوصية
+    except Exception:  # noqa: BLE001
+        pass
+    S.add_x_login(username, email, password)
+    xreader.invalidate()
+    await event.respond("⏳ جاري تسجيل الدخول إلى X…")
+    try:
+        if await xreader.ensure_login():
+            await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
+        else:
+            await event.respond("❌ تعذّر الدخول بأي حساب. تحقق من البيانات.")
+    except Exception as e:  # noqa: BLE001
+        await event.respond(
+            f"❌ فشل تسجيل الدخول إلى X: {e}\n"
+            "قد يطلب تأكيداً أمنياً؛ سجّل الدخول من المتصفح مرة ثم أعد المحاولة."
+        )
+
+
+async def _switch_x_login(event, text):
+    _clear_state(event.sender_id)
+    if not S.set_active_x_login(text.lstrip("@")):
+        await event.respond("لم أجد حساب دخول بهذا الاسم.")
+        return
+    xreader.invalidate()
+    try:
+        ok = await xreader.ensure_login()
+        await event.respond(
+            f"✅ الحساب النشط الآن: @{xreader.active}" if ok
+            else "❌ تعذّر الدخول بهذا الحساب."
+        )
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ فشل: {e}")
+
+
+async def _apply_edit(event, st):
+    item_id = st["item_id"]
+    _clear_state(event.sender_id)
+    item = PENDING.get(item_id)
+    blocked = _publish_block_message(item_id, item)
+    if blocked:
+        await event.respond(blocked)
+        return
+    if not item:
+        await event.respond("المنشور لم يعد متاحاً.")
+        return
+    PENDING.update(item_id, text=event.text)
+    await _send_for_review(item_id, refresh=True)
+    await event.respond("✅ تم تحديث النص في رسالة المراجعة.")
+
+
+# ============ تسجيل الدخول ============
 async def _login_phone(event, raw):
-    phone = _normalize_phone(raw)
+    phone = normalize_phone(raw, S.get("default_cc"))
     if not phone:
         await event.respond(
             "⚠️ الرقم بدون رمز دولة. إمّا أرسله كـ `+9665...`\n"
@@ -712,9 +1468,9 @@ async def _login_phone(event, raw):
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ تعذّر إرسال الرمز: {e}")
         return
-    state[event.sender_id] = {
+    _set_state(event.sender_id, {
         "action": "login_code", "phone": phone, "hash": sent.phone_code_hash
-    }
+    })
     await event.respond(
         "📩 وصلك رمز داخل تلغرام. أرسله **مع فواصل** حتى لا يُلغى تلقائياً، مثل:\n"
         "`1 2 3 4 5`"
@@ -726,12 +1482,12 @@ async def _login_code(event, st, text):
     try:
         await user.sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
     except SessionPasswordNeededError:
-        state[event.sender_id] = {"action": "login_password", "phone": st["phone"]}
+        _set_state(event.sender_id, {"action": "login_password", "phone": st["phone"]})
         await event.respond("🔒 الحساب محمي بكلمة مرور (تحقق بخطوتين). أرسلها الآن:")
         return
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ رمز غير صحيح أو منتهٍ: {e}\nأعد المحاولة من 🔐.")
-        state.pop(event.sender_id, None)
+        _clear_state(event.sender_id)
         return
     await _login_done(event, st["phone"])
 
@@ -742,6 +1498,10 @@ async def _login_password(event, st, password):
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ كلمة المرور غير صحيحة: {e}")
         return
+    try:
+        await event.delete()   # كلمة مرور الحساب لا تبقى في المحادثة
+    except Exception:  # noqa: BLE001
+        pass
     await _login_done(event, st.get("phone") or S.get("user_phone"))
 
 
@@ -749,7 +1509,7 @@ async def _login_done(event, phone):
     me = await user.get_me()
     if phone:
         S.set("user_phone", phone)
-    state.pop(event.sender_id, None)
+    _clear_state(event.sender_id)
     await event.respond(
         f"✅ تم تسجيل الدخول: {me.first_name} (id `{me.id}`)\n"
         "الآن أضف القنوات من 📡."
@@ -765,51 +1525,136 @@ async def _add_source(event, raw):
             "❌ تعذّر الوصول للقناة. تأكد أن حسابك الشخصي **عضو فيها**.\n" f"{e}"
         )
         return
+    if peer_id == S.get("review_chat_id"):
+        await event.respond("⚠️ لا يمكن جعل قروب المراجعة نفسه مصدراً (حلقة لا نهائية).")
+        return
     added = S.add_source(peer_id, title, raw)
     _rebuild_ids()
-    state.pop(event.sender_id, None)
+    _clear_state(event.sender_id)
     await event.respond(
         f"✅ أُضيفت: {title} (`{peer_id}`)" if added else f"ℹ️ موجودة مسبقاً: {title}"
     )
 
 
 # ============ قارئ X: التنزيل والمعالجة والدوران ============
-def _download_url(url, dest_dir):
-    ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
-    path = os.path.join(dest_dir, f"x_{secrets.token_hex(6)}{ext}")
-    with requests.get(url, stream=True, timeout=90) as r:
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
+def _open_media_stream(url, max_hops=3):
+    """
+    يفتح رابط وسائط X بعد التأكد أنه يشير إلى نطاق موثوق — في كل تحويلة أيضاً.
+
+    ⚠️ أمان (SSRF): الروابط تأتي من ردود twikit وليست من عندنا. بلا تقييد، ردٌّ
+    مُلاعَب (أو تحويلة) يجعل البوت يجلب عناوين داخل الشبكة المحلية للـ Pi.
+    """
+    for _ in range(max_hops):
+        if not _trusted_media_url(url):
+            raise ValueError(f"رابط وسائط غير موثوق: {url[:80]}")
+        resp = requests.get(url, stream=True, timeout=90, allow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            resp.close()
+            if not location:
+                raise ValueError("تحويلة بلا وجهة")
+            url = urljoin(url, location)
+            continue
+        return resp
+    raise ValueError("تجاوز عدد التحويلات المسموح")
+
+
+def _download_url(url, dest_dir, max_bytes=0):
+    """ينزّل وسيطاً بحد أقصى للحجم — بدونه فيديو ضخم واحد يملأ بطاقة الـ SD."""
+    ext = os.path.splitext(urlsplit(url).path)[1]
+    if not _SAFE_EXT.match(ext):      # امتداد من رابط خارجي — لا نثق به كما هو
+        ext = ".bin"
+    path = os.path.join(dest_dir, f"x_{secrets.token_hex(8)}{ext}")
+    try:
+        with _open_media_stream(url) as r:
+            r.raise_for_status()
+            declared = int(r.headers.get("Content-Length") or 0)
+            if max_bytes and declared > max_bytes:
+                raise ValueError(
+                    f"حجم الوسيط {human_size(declared)} يتجاوز الحد "
+                    f"{human_size(max_bytes)}"
+                )
+            written = 0
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise ValueError(
+                            f"الوسيط تجاوز الحد {human_size(max_bytes)} أثناء التنزيل"
+                        )
+                    f.write(chunk)
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
     return path
 
 
 async def handle_x_tweet(account, tweet):
+    origin = f"https://x.com/{account['screen_name']}/status/{tweet.id}"
+    existing = next(
+        (
+            (item_id, item)
+            for item_id, item in PENDING.items.items()
+            if item.get("origin") == origin
+        ),
+        None,
+    )
+    if existing:
+        # انقطع التشغيل/فشل settings بعد حفظ pending. ثبّت المؤشر أولاً؛ ثم
+        # أرسل نفس العنصر فقط إن لم تكن له رسالة مراجعة، بلا تنزيل أو add جديد.
+        item_id, item = existing
+        try:
+            S.set_x_last_id(account["screen_name"], str(tweet.id))
+        except Exception as e:  # noqa: BLE001
+            log.error("تعذّر استئناف مؤشر X للمنشور %s: %s", item_id, e)
+            await _notify_owner(
+                "⚠️ تعذّر تثبيت مؤشر X لمنشور محفوظ؛ سأعيد المحاولة دون "
+                f"إنشاء نسخة أخرى.\n{e}"
+            )
+            return False
+        if item.get("review") is None:
+            try:
+                await _send_for_review(item_id)
+            except Exception as e:  # noqa: BLE001
+                log.error("ثُبّت مؤشر X لكن تعذّر إرسال المنشور %s للمراجعة: %s", item_id, e)
+                await _notify_owner(
+                    "⚠️ ثُبّت مؤشر X والمنشور محفوظ، لكن تعذّر عرضه للمراجعة. "
+                    f"سيحاول outbox إرساله دورياً.\n{e}"
+                )
+        return True
+
     text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
     if S.is_filtered(text):
         log.info("تجاهل تغريدة (فلتر كلمات)")
         S.set_x_last_id(account["screen_name"], str(tweet.id))
-        return
-    media_path = media_type = None
-    urls = XReader.extract_media_urls(tweet)
-    if urls:
-        url, media_type = urls[0]  # نأخذ أول وسيط
+        return True
+
+    media = []
+    max_bytes = _max_media_bytes()
+    for url, kind in XReader.extract_media_urls(tweet)[:MAX_ALBUM_PHOTOS]:
         try:
-            media_path = await asyncio.to_thread(_download_url, url, S.get("download_dir"))
+            path = await asyncio.to_thread(_download_url, url, DOWNLOAD_DIR, max_bytes)
         except Exception as e:  # noqa: BLE001
             log.warning("فشل تنزيل وسيط X: %s", e)
-            media_path = media_type = None
+            continue
+        media.append({"path": path, "type": kind})
 
-    item_id = _new_id()
-    pending[item_id] = {"text": text, "media_path": media_path, "media_type": media_type}
-    log.info("تغريدة جديدة من @%s (%s)", account["screen_name"], media_type or "نص")
-    try:
-        await _send_for_review(item_id)
-    except Exception as e:  # noqa: BLE001
-        log.error("فشل إرسال التغريدة للمراجعة: %s", e)
-        _cleanup(item_id)
-    S.set_x_last_id(account["screen_name"], str(tweet.id))
+    log.info("تغريدة جديدة من @%s (%s)", account["screen_name"], media_summary(media) or "نص")
+    item_id = await _queue_for_review(
+        text,
+        media,
+        origin,
+        on_persisted=lambda: S.set_x_last_id(
+            account["screen_name"], str(tweet.id)
+        ),
+    )
+    if item_id is None:
+        # لا نتجاوز تغريدة لم تصل للمراجعة؛ ستظهر مجدداً في الدورة التالية.
+        return False
+    return True
 
 
 _x_alerted = False
@@ -830,7 +1675,13 @@ async def x_poller():
                             await asyncio.sleep(random.uniform(3, 10))
                         try:
                             for tw in await xreader.fetch_new(acc):
-                                await handle_x_tweet(acc, tw)
+                                if not await handle_x_tweet(acc, tw):
+                                    log.warning(
+                                        "توقفت معالجة @%s لأن إرسال المراجعة فشل؛ "
+                                        "سأعيد المحاولة في الدورة القادمة.",
+                                        acc["screen_name"],
+                                    )
+                                    break
                         except Exception as e:  # noqa: BLE001
                             if xreader.report_failure(e):
                                 await _notify_owner(
@@ -848,8 +1699,30 @@ async def x_poller():
         except Exception as e:  # noqa: BLE001
             log.warning("دورة X: %s", e)
         # فاصل عشوائي بين الدورات حتى لا يبان الإيقاع ساعةً منتظمة
-        base = S.get("x_poll_seconds", 120)
+        base = S.get_int("x_poll_seconds", 120)
         await asyncio.sleep(random.uniform(base * 0.7, base * 1.6))
+
+
+# ============ التنظيف الدوري ============
+async def housekeeping():
+    """
+    بدون هذا كانت المنشورات غير المُراجَعة وملفاتها تتراكم للأبد حتى تمتلئ
+    بطاقة الـ SD على الـ Pi.
+    """
+    while True:
+        await asyncio.sleep(HOUSEKEEPING_SECONDS)
+        try:
+            # outbox أولاً: لا نترك فشل Telegram ينتظر إعادة تشغيل قد لا تحدث.
+            await _replay_unreviewed()
+            # PendingStore يستثني outbox وحالات publishing/published بنفسه.
+            expired = PENDING.purge_expired()
+            orphans = PENDING.sweep_orphans()
+            _purge_states()
+            _harden_state_permissions()   # الجلسات تُعاد كتابتها أحياناً
+            if expired or orphans:
+                log.info("تنظيف: %d منشور منتهٍ، %d ملف يتيم", expired, orphans)
+        except Exception as e:  # noqa: BLE001
+            log.warning("فشل التنظيف الدوري: %s", e)
 
 
 # ============ التشغيل ============
@@ -857,17 +1730,29 @@ async def main():
     global _claim_code
     await bot.start(bot_token=S.get("bot_token"))
     await user.connect()
+    _harden_state_permissions()   # ملفات الجلسة تُنشأ الآن — قيّدها فوراً
+
+    if S.recovery == "recovered":
+        log.warning("تم استرجاع الإعدادات من النسخة الاحتياطية بعد تلف الملف.")
+    elif S.recovery == "corrupt":
+        log.error("ملف الإعدادات كان تالفاً — راجع الملفات بلاحقة .corrupt-*")
 
     if not S.get("owner_id"):
-        _claim_code = f"{secrets.randbelow(1000000):06d}"
-        log.warning("=" * 48)
+        _claim_code = secrets.token_urlsafe(9)
+        log.warning("=" * 56)
         log.warning("لا يوجد مالك بعد. أرسل للبوت في تلغرام:  /claim %s", _claim_code)
-        log.warning("=" * 48)
+        log.warning("=" * 56)
 
     _rebuild_ids()
+    # استعد outbox والحالات المؤكدة/غير المحسومة قبل أي تنظيف بالـTTL.
+    await _replay_unreviewed()
+    PENDING.purge_expired()
+    PENDING.sweep_orphans()
+
     authed = await user.is_user_authorized()
     bot_me = await bot.get_me()
     log.info("البوت: @%s | الحساب الشخصي مسجّل: %s", bot_me.username, authed)
+    log.info("منشورات بانتظار المراجعة: %d", len(PENDING.items))
     if not authed:
         log.info("الحساب غير مسجّل — سجّل الدخول من زر 🔐 داخل البوت.")
 
@@ -875,6 +1760,7 @@ async def main():
         user.run_until_disconnected(),
         bot.run_until_disconnected(),
         x_poller(),
+        housekeeping(),
     )
 
 

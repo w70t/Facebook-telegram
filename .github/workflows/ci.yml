@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: تثبيت الاعتماديات وأدوات الاختبار
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt pytest pyflakes
+
+      - name: فحص الصياغة
+        run: python -m pyflakes *.py tests/*.py
+
+      - name: الاختبارات (وحدة + تكامل)
+        run: python -m pytest -q
+
+      - name: التأكد أن اختبارات التكامل لم تُتخطَّ
+        run: |
+          python -m pytest tests/test_integration.py -q --collect-only >/dev/null
+          python -m pytest tests/test_integration.py -q 2>&1 | tee /tmp/it.log
+          grep -q "skipped" /tmp/it.log && { echo "❌ تُخطّيت اختبارات التكامل"; exit 1; }
+          echo "✅ اختبارات التكامل عملت فعلاً"
+
+      - name: التأكد أن telethon المثبّت غير مصاب بثغرة المسار
+        run: |
+          python - <<'PY'
+          import telethon, os
+          from telethon.client.downloads import DownloadMethods
+          out = DownloadMethods._get_proper_filename(
+              "downloads", "document", ".bin",
+              possible_names=["../../../../etc/cron.d/pwn"])
+          assert os.path.normpath(out).startswith("downloads"), (
+              f"telethon {telethon.__version__} مصاب بـ path traversal: {out}")
+          print("✅ telethon", telethon.__version__, "سليم")
+          PY
+
+      - name: التأكد أن الأسرار مستثناة من git
+        run: |
+          set -e
+          for f in settings.json pending.json x_cookies_someone.json user_session.session; do
+            touch "$f"
+            git check-ignore -q "$f" || { echo "❌ $f غير مستثنى في .gitignore"; exit 1; }
+            rm -f "$f"
+          done
+          echo "✅ كل ملفات الأسرار مستثناة"
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: تثبيت الاعتماديات وأدوات الاختبار
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt pytest pyflakes
+
+      - name: فحص الصياغة
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath . -Filter *.py -File)
+          $files += @(Get-ChildItem -LiteralPath tests -Filter *.py -File)
+          python -m pyflakes $files.FullName
+
+      - name: الاختبارات على Windows
+        run: python -m pytest -q

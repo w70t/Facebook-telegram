@@ -8,16 +8,26 @@ import logging
 import os
 import re
 
-from settings import BASE_DIR
+from settings import SETTINGS_FILE
+
+BASE_DIR = os.path.dirname(os.path.abspath(SETTINGS_FILE))
 
 log = logging.getLogger("tg2fb.x")
 
-# كلمات تدل على مشكلة مصادقة/حظر (لتمييزها عن أخطاء الشبكة العابرة)
+# كلمات تدل على مشكلة مصادقة/حظر (لتمييزها عن أخطاء الشبكة العابرة).
+# \b ضرورية: بدونها كان "bandwidth" و"banner" يطابقان "ban" فيُحرق حساب سليم.
 AUTH_HINTS = re.compile(
-    r"unauthoriz|401|403|forbidden|suspend|ban|locked|could not authenticate|"
-    r"denied|blocked|not authorized",
+    r"\b(?:401|403|unauthoriz\w*|forbidden|suspend\w*|banned|ban|locked|"
+    r"could not authenticate|denied|blocked|not\s+authorized|"
+    r"invalid\s+token|bad\s+token|login\s+required|session\s+expired)\b",
     re.I,
 )
+
+# أسماء استثناءات twikit التي تعني قطعاً مشكلة حساب لا مشكلة شبكة
+AUTH_EXC_NAMES = {
+    "Unauthorized", "Forbidden", "AccountSuspended", "AccountLocked",
+    "UserUnavailable", "CouldNotTweet",
+}
 
 
 def _cookies_path(username):
@@ -25,8 +35,52 @@ def _cookies_path(username):
     return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
 
 
+def _touch_private(path):
+    """ينشئ الملف فارغاً بصلاحيات 600 قبل أن تكتب فيه المكتبة."""
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
+    except OSError as e:
+        log.warning("تعذّر تهيئة ملف الكوكيز %s: %s", path, e)
+
+
+def _restrict(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _drop_cookies(username):
+    """
+    يحذف ملف الكوكيز. بدون هذا كانت الكوكيز المنتهية تُحمّل مجدداً إلى ما لا نهاية
+    فيبقى الحساب "فاشلاً" حتى بعد الضغط على زر ♻️ إعادة التفعيل.
+    """
+    path = _cookies_path(username)
+    try:
+        os.remove(path)
+        log.info("حُذفت كوكيز X المنتهية لـ %s", username)
+    except OSError:
+        pass
+
+
 def is_auth_error(exc):
+    if type(exc).__name__ in AUTH_EXC_NAMES:
+        return True
     return bool(AUTH_HINTS.search(str(exc)))
+
+
+def is_newer(tweet_id, last_id):
+    """
+    مقارنة رقمية: معرّفات X تصاعدية زمنياً.
+    المقارنة بالتساوي (==) كانت تفشل لو حُذفت التغريدة المرجعية أو خرجت من
+    نافذة آخر 20 تغريدة، فتُعاد كل التغريدات من جديد.
+    """
+    if last_id in (None, ""):
+        return True
+    try:
+        return int(tweet_id) > int(last_id)
+    except (TypeError, ValueError):
+        return str(tweet_id) != str(last_id)
 
 
 class XReader:
@@ -47,19 +101,47 @@ class XReader:
         self.active = None
         self.ready = False
 
+    @staticmethod
+    async def _verify(client, username):
+        """
+        نداء خفيف للتأكد أن الكوكيز المحمّلة ما زالت صالحة.
+        بدونه كنا نضع ready=True بكوكيز ميتة، فيفشل كل جلب لاحق ويُعلَّم الحساب محظوراً.
+        """
+        probe = getattr(client, "user", None)
+        if callable(probe):
+            await probe()
+            return
+        await client.get_user_by_screen_name(username)
+
     async def _activate(self, cred):
         username = cred["username"]
         client = self._new_client()
         cpath = _cookies_path(username)
+        authenticated = False
+
         if os.path.exists(cpath):
-            client.load_cookies(cpath)
-        else:
+            try:
+                _restrict(cpath)          # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
+                client.load_cookies(cpath)
+                await self._verify(client, username)
+                authenticated = True
+            except Exception as e:  # noqa: BLE001
+                log.warning("كوكيز X لـ %s غير صالحة (%s) — إعادة تسجيل دخول", username, e)
+                _drop_cookies(username)
+                client = self._new_client()
+
+        if not authenticated:
             await client.login(
                 auth_info_1=username,
                 auth_info_2=cred.get("email") or username,
                 password=cred["password"],
             )
+            # الكوكيز = جلسة دخول X كاملة. ننشئ الملف بصلاحيات مقيّدة *قبل*
+            # الكتابة؛ الاكتفاء بـ chmod بعدها يترك نافذة يكون فيها 0644.
+            _touch_private(cpath)
             client.save_cookies(cpath)
+            _restrict(cpath)
+
         self.client = client
         self.active = username
         self.ready = True
@@ -77,6 +159,7 @@ class XReader:
                 return True
             except Exception as e:  # noqa: BLE001
                 log.warning("فشل دخول X %s: %s", cred["username"], e)
+                _drop_cookies(cred["username"])
                 self.S.mark_x_login_failed(cred["username"], True)
                 self.invalidate()
         return False
@@ -84,18 +167,34 @@ class XReader:
     def report_failure(self, exc):
         """يُستدعى عند خطأ أثناء الجلب: يعلّم الحساب النشط كمحظور إن كان خطأ مصادقة."""
         if self.active and is_auth_error(exc):
+            _drop_cookies(self.active)
             self.S.mark_x_login_failed(self.active, True)
             self.invalidate()
             return True
         return False
 
     async def resolve(self, screen_name):
-        await self.ensure_login()
+        if not await self.ensure_login():
+            raise RuntimeError("لا يوجد حساب دخول X صالح")
         user = await self.client.get_user_by_screen_name(screen_name.lstrip("@"))
         return str(user.id), getattr(user, "name", screen_name)
 
+    async def latest_tweet_id(self, user_id):
+        """
+        أحدث معرّف تغريدة الآن — يُستخدم كنقطة بداية عند إضافة حساب جديد حتى لا
+        تُرسل عشرون تغريدة قديمة دفعة واحدة إلى قروب المراجعة.
+        """
+        try:
+            tweets = await self.client.get_user_tweets(user_id, "Tweets", count=1)
+        except Exception as e:  # noqa: BLE001
+            log.warning("تعذّر جلب أحدث تغريدة لـ %s: %s", user_id, e)
+            return None
+        for tw in tweets:
+            return str(tw.id)
+        return None
+
     @staticmethod
-    def _is_reply(tweet, own_id=None):
+    def _is_reply(tweet):
         """يكتشف إن كانت التغريدة رداً (بأشكال twikit المختلفة)."""
         for attr in ("in_reply_to", "in_reply_to_status_id", "in_reply_to_user_id"):
             if getattr(tweet, attr, None):
@@ -103,28 +202,47 @@ class XReader:
         text = getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or ""
         return text.lstrip().startswith("@")
 
-    async def fetch_new(self, account):
-        await self.ensure_login()
-        tweets = await self.client.get_user_tweets(
-            account["user_id"], "Tweets", count=20
-        )
-        skip_replies = self.S.get("x_skip_replies", True)
+    @staticmethod
+    def select_new(tweets, account, skip_replies=True, limit=5):
+        """
+        يفرز التغريدات الجديدة (الأقدم أولاً) بحد أقصى limit لكل دورة.
+        الفرز بالمقارنة لا بالتوقف عند أول تطابق — أمتن لو تغيّر ترتيب النتائج أو
+        حُذفت تغريدة. ما يتجاوز الحد يُلتقط في الدورة التالية لأننا نعالج الأقدم أولاً.
+        """
         last_id = account.get("last_id")
         fresh = []
         for tw in tweets:
-            tid = str(tw.id)
-            if last_id is not None and tid == str(last_id):
-                break
+            if not is_newer(tw.id, last_id):
+                continue
             if getattr(tw, "retweeted_tweet", None) is not None:
-                continue  # نتجاهل الريتويت
-            if skip_replies and self._is_reply(tw, account.get("user_id")):
-                continue  # نتجاهل الردود — تغريدات فقط
+                continue                              # نتجاهل الريتويت
+            if skip_replies and XReader._is_reply(tw):
+                continue                              # نتجاهل الردود — تغريدات فقط
             fresh.append(tw)
-        fresh.reverse()
-        return fresh
+
+        def sort_key(tw):
+            try:
+                return int(tw.id)
+            except (TypeError, ValueError):
+                return 0
+
+        fresh.sort(key=sort_key)                      # الأقدم أولاً
+        return fresh[:limit] if limit else fresh
+
+    async def fetch_new(self, account):
+        if not await self.ensure_login():
+            raise RuntimeError("لا يوجد حساب دخول X صالح")
+        tweets = await self.client.get_user_tweets(account["user_id"], "Tweets", count=20)
+        return self.select_new(
+            tweets,
+            account,
+            skip_replies=self.S.get("x_skip_replies", True),
+            limit=self.S.get_int("x_max_per_cycle", 5),
+        )
 
     @staticmethod
     def extract_media_urls(tweet):
+        """كل وسائط التغريدة — لا الأولى فقط."""
         out = []
         media = getattr(tweet, "media", None) or []
         for m in media:

@@ -1,11 +1,23 @@
+# أسرار وحالة تشغيل — لا تُرفع أبداً
 .env
 settings.json
+settings.json.bak
+pending.json
+pending.json.bak
+*.corrupt-*
+sources.json
+
+# جلسات تلغرام (= دخول كامل للحساب)
 *.session
 *.session-journal
-sources.json
-x_cookies.json
+
+# كوكيز X — كل حساب في ملف باسمه: x_cookies_<username>.json
+# النمط القديم (x_cookies.json) لم يكن يطابقها، فكانت جلسات X تُرفع إلى GitHub.
+x_cookies*.json
+
 downloads/
 __pycache__/
 *.pyc
 venv/
 .venv/
+.pytest_cache/
