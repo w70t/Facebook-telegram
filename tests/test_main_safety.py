@@ -8,7 +8,16 @@ import pytest
 
 
 RELOADABLE = ("main", "settings", "store", "util", "twitter", "facebook", "jsonio")
-TELETHON_MODULES = ("telethon", "telethon.events", "telethon.errors", "telethon.utils")
+_MISSING = object()
+
+
+def _telethon_modules():
+    """يلتقط مساحة أسماء Telethon كاملة كي لا تتسرّب النسخة الحقيقية للاختبار."""
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "telethon" or name.startswith("telethon.")
+    }
 
 
 @pytest.fixture
@@ -18,7 +27,10 @@ def app(tmp_path):
         for key in ("SETTINGS_FILE", "API_ID", "API_HASH", "BOT_TOKEN")
     }
     saved_mods = {name: sys.modules.get(name) for name in RELOADABLE}
-    saved_telethon = {name: sys.modules.get(name) for name in TELETHON_MODULES}
+    saved_telethon = _telethon_modules()
+    saved_stub = sys.modules.get("stub_telethon", _MISSING)
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    added_tests_dir = tests_dir not in sys.path
     main = None
     try:
         os.environ.update({
@@ -29,14 +41,12 @@ def app(tmp_path):
         })
         for name in RELOADABLE:
             sys.modules.pop(name, None)
-        try:
-            __import__("telethon")
-        except ModuleNotFoundError:
-            tests_dir = os.path.dirname(os.path.abspath(__file__))
-            if tests_dir not in sys.path:
-                sys.path.insert(0, tests_dir)
-            import stub_telethon
-            stub_telethon.install()
+        for name in saved_telethon:
+            sys.modules.pop(name, None)
+        if added_tests_dir:
+            sys.path.insert(0, tests_dir)
+        import stub_telethon
+        stub_telethon.install()
 
         import main as loaded_main
         main = loaded_main
@@ -55,11 +65,18 @@ def app(tmp_path):
         for name in RELOADABLE:
             sys.modules.pop(name, None)
         sys.modules.update({name: mod for name, mod in saved_mods.items() if mod is not None})
-        for name in TELETHON_MODULES:
+        for name in _telethon_modules():
             sys.modules.pop(name, None)
-        sys.modules.update({
-            name: mod for name, mod in saved_telethon.items() if mod is not None
-        })
+        sys.modules.update(saved_telethon)
+        if saved_stub is _MISSING:
+            sys.modules.pop("stub_telethon", None)
+        else:
+            sys.modules["stub_telethon"] = saved_stub
+        if added_tests_dir:
+            try:
+                sys.path.remove(tests_dir)
+            except ValueError:
+                pass
         for key, value in saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -94,6 +111,12 @@ class Event:
         if self.fail_edit:
             raise RuntimeError("Telegram edit failed")
         self.edits.append(text)
+
+
+def test_app_fixture_always_uses_stub_telethon(app):
+    stub = sys.modules["stub_telethon"]
+    assert app.TelegramClient is stub.TelegramClient
+    assert sys.modules["telethon"].TelegramClient is stub.TelegramClient
 
 
 def test_concurrent_publish_claim_allows_only_one_facebook_call(app, monkeypatch):
