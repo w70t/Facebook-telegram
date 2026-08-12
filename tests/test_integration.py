@@ -195,7 +195,11 @@ def bot(app, monkeypatch):
 
 
 def photo_file(app, name):
-    path = os.path.join(app.DOWNLOAD_DIR, name)
+    # PendingStore deliberately accepts only application-managed media names.
+    # Keep the descriptive test name while giving it the same prefix as real
+    # files produced by _safe_media_path().
+    managed_name = name if name.startswith(("tg_", "x_")) else f"tg_{name}"
+    path = os.path.join(app.DOWNLOAD_DIR, managed_name)
     with open(path, "wb") as f:
         f.write(b"\xff\xd8\xff" + b"0" * 64)
     return path
@@ -347,14 +351,16 @@ def test_expired_token_keeps_post_and_warns(app, bot, graph_bound):
     assert not event.edits                              # لم يُعلَن نجاح كاذب
 
 
-def test_transient_failure_is_retried(app, bot, graph_bound):
+def test_transient_post_is_not_retried_and_stays_uncertain(app, bot, graph_bound):
     graph_bound.fail_times = 2
     item_id = run(app._queue_for_review("مع إعادة محاولة", []))
-    run(app._publish(FakeEvent(), item_id, include_media=True))
+    event = FakeEvent()
+    run(app._publish(event, item_id, include_media=True))
 
     feed = [r for r in graph_bound.requests if r["path"].endswith("/feed")]
-    assert len(feed) == 3                               # فشلان ثم نجاح
-    assert app.PENDING.get(item_id) is None
+    assert len(feed) == 1       # POST غير idempotent: ممنوع تكراره تلقائياً
+    assert app.PENDING.get(item_id)["publish_state"] == "publishing"
+    assert any("غير محسومة" in response for response in event.responses)
 
 
 def test_token_check_detects_expiry(app, graph_bound):
@@ -407,15 +413,29 @@ def test_real_telethon_directory_mode_is_the_risky_one(app):
     )
 
 
-def test_session_files_are_locked_down(app):
-    probe = os.path.join(app.BASE_DIR, "_integration_probe.session")
-    try:
-        open(probe, "w").close()
-        os.chmod(probe, 0o644)
-        app._harden_state_permissions()
+def test_session_files_are_locked_down(app, tmp_path):
+    probe = os.path.join(str(tmp_path), "_integration_probe.session")
+    with open(probe, "w", encoding="utf-8") as f:
+        f.write("fake session")
+    os.chmod(probe, 0o644)
+    app._harden_state_permissions(str(tmp_path))
+    if os.name == "posix":
         assert stat.S_IMODE(os.stat(probe).st_mode) == 0o600
-    finally:
-        os.remove(probe)
+
+
+def test_telethon_sessions_live_beside_settings_not_checkout(app):
+    expected = os.path.normcase(os.path.realpath(app.STATE_DIR))
+    for client in (app.user, app.bot):
+        filename = os.path.realpath(client.session.filename)
+        assert os.path.normcase(os.path.dirname(filename)) == expected
+
+
+def test_x_cookie_state_lives_beside_settings(app):
+    import twitter
+
+    expected = os.path.normcase(os.path.realpath(app.STATE_DIR))
+    cookie_dir = os.path.dirname(os.path.realpath(twitter._cookies_path("acct")))
+    assert os.path.normcase(cookie_dir) == expected
 
 
 # ════════════════════════ ٤) قارئ X ببديل twikit ════════════════════════
@@ -472,9 +492,10 @@ def test_stale_cookies_trigger_fresh_login(app, monkeypatch, tmp_path):
 
     monkeypatch.setattr(type(app.xreader), "_new_client", factory)
 
-    from twitter import _cookies_path
+    import twitter
 
-    cookie_file = _cookies_path("acct")
+    monkeypatch.setattr(twitter, "BASE_DIR", str(tmp_path))
+    cookie_file = twitter._cookies_path("acct")
     with open(cookie_file, "w", encoding="utf-8") as f:
         json.dump({"auth_token": "expired"}, f)
     try:
@@ -482,18 +503,21 @@ def test_stale_cookies_trigger_fresh_login(app, monkeypatch, tmp_path):
         assert run(app.xreader.ensure_login()) is True
         assert clients[-1].logged_in, "لم يُعد تسجيل الدخول بعد فشل الكوكيز"
         assert clients[-1].saved_to == cookie_file
-        assert stat.S_IMODE(os.stat(cookie_file).st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(os.stat(cookie_file).st_mode) == 0o600
     finally:
         app.xreader.invalidate()
         if os.path.exists(cookie_file):
             os.remove(cookie_file)
 
 
-def test_auth_failure_drops_cookies(app, monkeypatch):
-    from twitter import _cookies_path
+def test_auth_failure_drops_cookies(app, monkeypatch, tmp_path):
+    import twitter
 
-    cookie_file = _cookies_path("acct")
-    open(cookie_file, "w").close()
+    monkeypatch.setattr(twitter, "BASE_DIR", str(tmp_path))
+    cookie_file = twitter._cookies_path("acct")
+    with open(cookie_file, "w", encoding="utf-8"):
+        pass
     try:
         app.xreader.active = "acct"
         assert app.xreader.report_failure(Exception("403 Forbidden")) is True
@@ -530,8 +554,8 @@ def repo(app, tmp_path, monkeypatch):
     run_git("init", "-q", "-b", "main", cwd=upstream)
     run_git("config", "user.email", "t@t", cwd=upstream)
     run_git("config", "user.name", "t", cwd=upstream)
-    (upstream / "requirements.txt").write_text("requests>=2.31\n")
-    (upstream / "main.py").write_text("# bot\n")
+    (upstream / "requirements.txt").write_text("requests>=2.31\n", encoding="utf-8")
+    (upstream / "main.py").write_text("# bot\n", encoding="utf-8")
     run_git("add", "-A", cwd=upstream)
     run_git("commit", "-qm", "init", cwd=upstream)
 
@@ -554,13 +578,13 @@ def repo(app, tmp_path, monkeypatch):
 
 
 def test_update_restarts_after_successful_pull(app, repo, monkeypatch):
-    (repo.upstream / "main.py").write_text("# bot v2\n")
+    (repo.upstream / "main.py").write_text("# bot v2\n", encoding="utf-8")
     repo.git("commit", "-qam", "v2", cwd=repo.upstream)
 
     event = FakeEvent()
     with pytest.raises(Restarted):
         run(app._self_update(event))
-    assert "# bot v2" in (repo.clone / "main.py").read_text()
+    assert "# bot v2" in (repo.clone / "main.py").read_text(encoding="utf-8")
     assert any("إعادة تشغيل" in r for r in event.responses)
 
 
@@ -569,18 +593,20 @@ def test_failed_pull_does_not_restart(app, repo):
     البق الأصلي: كان يعيد التشغيل حتى لو فشل السحب. تعديل محلي متعارض يجعل
     --ff-only يفشل؛ إعادة التشغيل هنا تعني حلقة أعطال على الـ Pi.
     """
-    (repo.clone / "main.py").write_text("# تعديل محلي\n")
-    (repo.upstream / "main.py").write_text("# upstream مختلف\n")
+    (repo.clone / "main.py").write_text("# تعديل محلي\n", encoding="utf-8")
+    (repo.upstream / "main.py").write_text("# upstream مختلف\n", encoding="utf-8")
     repo.git("commit", "-qam", "upstream", cwd=repo.upstream)
 
     event = FakeEvent()
     run(app._self_update(event))                     # لا Restarted = لم يُعد التشغيل
     assert any("فشل السحب" in r for r in event.responses)
-    assert (repo.clone / "main.py").read_text() == "# تعديل محلي\n"
+    assert (repo.clone / "main.py").read_text(encoding="utf-8") == "# تعديل محلي\n"
 
 
 def test_changed_requirements_trigger_pip(app, repo, monkeypatch):
-    (repo.upstream / "requirements.txt").write_text("requests>=2.31\nnewdep>=1.0\n")
+    (repo.upstream / "requirements.txt").write_text(
+        "requests>=2.31\nnewdep>=1.0\n", encoding="utf-8"
+    )
     repo.git("commit", "-qam", "deps", cwd=repo.upstream)
 
     calls = []

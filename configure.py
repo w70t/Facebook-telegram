@@ -36,10 +36,11 @@ def main():
         print("\n❌ API_ID لازم يكون رقماً.")
         return
 
-    s.data["api_id"] = api_id
-    s.data["api_hash"] = api_hash
-    s.data["bot_token"] = bot_token
-    s.save()
+    s.set_many({
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "bot_token": bot_token,
+    })
 
     print(f"\n✅ تم الحفظ في {s.path} (صلاحيات 600 — قراءة المالك فقط)")
     print("الآن شغّل البوت:  python main.py")

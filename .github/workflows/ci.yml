@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.11", "3.12"]
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +21,7 @@ jobs:
       - name: تثبيت الاعتماديات وأدوات الاختبار
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install pytest pyflakes requests "telethon>=1.42,<2"
+          pip install -r requirements.txt pytest pyflakes
 
       - name: فحص الصياغة
         run: python -m pyflakes *.py tests/*.py
@@ -58,3 +58,27 @@ jobs:
             rm -f "$f"
           done
           echo "✅ كل ملفات الأسرار مستثناة"
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: تثبيت الاعتماديات وأدوات الاختبار
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt pytest pyflakes
+
+      - name: فحص الصياغة
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath . -Filter *.py -File)
+          $files += @(Get-ChildItem -LiteralPath tests -Filter *.py -File)
+          python -m pyflakes $files.FullName
+
+      - name: الاختبارات على Windows
+        run: python -m pytest -q

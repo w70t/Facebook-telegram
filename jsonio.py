@@ -57,6 +57,25 @@ def read_json(path):
         return json.load(f)
 
 
+def _restore_backup(path, backup):
+    """Read a valid backup and replace the primary atomically."""
+    try:
+        data = read_json(backup)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        log.error("النسخة الاحتياطية %s تالفة أيضاً", backup)
+        return None, False
+
+    try:
+        atomic_write_json(path, data)
+    except OSError as exc:
+        # The caller can still continue with the recovered in-memory data.  Keep
+        # the backup intact so a later load can retry restoring the primary.
+        log.error("استُعيدت بيانات %s لكن تعذّر إصلاح الملف الأساسي: %s", backup, exc)
+    else:
+        log.warning("تم الاسترجاع من %s وإصلاح الملف الأساسي ذرّياً", backup)
+    return data, True
+
+
 def read_json_resilient(path, backup_suffix=".bak"):
     """
     يقرأ JSON مع استرجاع تلقائي:
@@ -66,8 +85,12 @@ def read_json_resilient(path, backup_suffix=".bak"):
 
     الملف التالف لا يُحذف أبداً؛ يُنقل إلى path.corrupt-<وقت> للفحص لاحقاً.
     """
+    backup = path + backup_suffix
     if not os.path.exists(path):
-        return None, None
+        if not os.path.exists(backup):
+            return None, None
+        data, recovered = _restore_backup(path, backup)
+        return (data, "recovered") if recovered else (None, "corrupt")
 
     try:
         return read_json(path), None
@@ -82,13 +105,9 @@ def read_json_resilient(path, backup_suffix=".bak"):
     except OSError:
         quarantine = None
 
-    backup = path + backup_suffix
     if os.path.exists(backup):
-        try:
-            data = read_json(backup)
-            log.warning("تم الاسترجاع من النسخة الاحتياطية %s", backup)
+        data, recovered = _restore_backup(path, backup)
+        if recovered:
             return data, "recovered"
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            log.error("النسخة الاحتياطية %s تالفة أيضاً", backup)
 
     return None, "corrupt"

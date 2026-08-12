@@ -9,7 +9,8 @@ def test_written_file_is_valid_and_owner_only(tmp_path):
     path = tmp_path / "d.json"
     atomic_write_json(str(path), {"مفتاح": "قيمة"})
     assert json.loads(path.read_text(encoding="utf-8")) == {"مفتاح": "قيمة"}
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
 def test_no_temp_files_left_behind(tmp_path):
@@ -48,7 +49,26 @@ def test_corrupt_file_quarantined_and_recovered(tmp_path):
     data, status = read_json_resilient(str(path))
     assert (data, status) == ({"a": 1}, "recovered")
     assert list(tmp_path.glob("d.json.corrupt-*"))
-    assert not path.exists()
+    assert json.loads(path.read_text(encoding="utf-8")) == {"a": 1}
+    assert json.loads((tmp_path / "d.json.bak").read_text(encoding="utf-8")) == {"a": 1}
+    assert read_json_resilient(str(path)) == ({"a": 1}, None)
+
+
+def test_missing_primary_is_recovered_from_backup(tmp_path):
+    path = tmp_path / "d.json"
+    backup = tmp_path / "d.json.bak"
+    backup.write_text('{"a": 2}', encoding="utf-8")
+
+    assert read_json_resilient(str(path)) == ({"a": 2}, "recovered")
+    assert json.loads(path.read_text(encoding="utf-8")) == {"a": 2}
+    assert json.loads(backup.read_text(encoding="utf-8")) == {"a": 2}
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_missing_primary_and_corrupt_backup(tmp_path):
+    (tmp_path / "d.json.bak").write_text("}}}", encoding="utf-8")
+    assert read_json_resilient(str(tmp_path / "d.json")) == (None, "corrupt")
 
 
 def test_corrupt_file_and_corrupt_backup(tmp_path):

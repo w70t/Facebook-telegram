@@ -1,8 +1,14 @@
 import json
 
 import pytest
+import requests
 
-from facebook import FacebookAuthError, FacebookError, FacebookPublisher
+from facebook import (
+    FacebookAuthError,
+    FacebookError,
+    FacebookPublisher,
+    FacebookUncertainError,
+)
 
 
 class FakeResponse:
@@ -62,19 +68,73 @@ def test_graph_version_is_configurable():
     assert FacebookPublisher("1", "tok").graph.endswith("/v23.0")
 
 
-def test_retries_then_succeeds(monkeypatch):
+def test_transient_post_is_uncertain_and_never_retried(monkeypatch):
     calls = []
 
     def fake_post(url, **kwargs):
         calls.append(url)
-        if len(calls) < 3:
-            return FakeResponse({"error": {"code": 2, "message": "temporary"}}, 500)
-        return FakeResponse({"id": "ok"})
+        return FakeResponse({"error": {"code": 2, "message": "temporary"}}, 500)
 
     monkeypatch.setattr("facebook.requests.post", fake_post)
+
+    with pytest.raises(FacebookUncertainError):
+        FacebookPublisher("1", "tok").post_text("مرحبا")
+    assert len(calls) == 1
+
+
+def test_connection_failure_post_is_uncertain_and_never_retried(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        raise requests.Timeout("response lost")
+
+    monkeypatch.setattr("facebook.requests.post", fake_post)
+
+    with pytest.raises(FacebookUncertainError):
+        FacebookPublisher("1", "tok").post_text("مرحبا")
+    assert len(calls) == 1
+
+
+def test_successful_post_with_malformed_body_is_uncertain(monkeypatch):
+    class MalformedSuccess:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            raise ValueError("empty body")
+
+    monkeypatch.setattr(
+        "facebook.requests.post", lambda *args, **kwargs: MalformedSuccess()
+    )
+
+    with pytest.raises(FacebookUncertainError):
+        FacebookPublisher("1", "tok").post_text("مرحبا")
+
+
+def test_successful_post_without_id_is_uncertain(monkeypatch):
+    monkeypatch.setattr(
+        "facebook.requests.post", lambda *args, **kwargs: FakeResponse({}, 200)
+    )
+
+    with pytest.raises(FacebookUncertainError):
+        FacebookPublisher("1", "tok").post_text("مرحبا")
+
+
+def test_get_retries_then_succeeds(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if len(calls) < 3:
+            return FakeResponse({"error": {"code": 2, "message": "temporary"}}, 500)
+        return FakeResponse({"id": "1", "name": "page"})
+
+    monkeypatch.setattr("facebook.requests.get", fake_get)
     monkeypatch.setattr("facebook.time.sleep", lambda *_: None)
 
-    assert FacebookPublisher("1", "tok").post_text("مرحبا") == {"id": "ok"}
+    assert FacebookPublisher("1", "tok").check_token()["name"] == "page"
     assert len(calls) == 3
 
 

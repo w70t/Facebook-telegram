@@ -90,16 +90,22 @@ for bad in ["../../me", "me", "123/../../me", "123 456", "", "abc",
     assert not main._FB_PAGE_ID.match(bad), bad
 
 # ── 6) تقييد صلاحيات ملفات الجلسة ──
-session = os.path.join(main.BASE_DIR, "_pytest_probe.session")
+# test_security.py runs this probe with a temporary working directory. Keep the
+# credential probe there so the smoke test never writes into checkout.
+session_dir = os.getcwd()
+session = os.path.join(session_dir, "_pytest_probe.session")
 try:
     with open(session, "w", encoding="utf-8") as f:
         f.write("fake session")
     os.chmod(session, 0o644)                     # كما ينشئها Telethon فعلياً
-    assert stat.S_IMODE(os.stat(session).st_mode) == 0o644
-    main._harden_state_permissions()
-    assert stat.S_IMODE(os.stat(session).st_mode) == 0o600, "لم تُقيَّد صلاحيات الجلسة"
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(session).st_mode) == 0o644
+    main._harden_state_permissions(session_dir)
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(session).st_mode) == 0o600, "لم تُقيَّد صلاحيات الجلسة"
 finally:
-    os.remove(session)
+    if os.path.exists(session):
+        os.remove(session)
 
 # ── 7) امتداد رابط X الخارجي لا يُوثق به ──
 assert main._SAFE_EXT.match(".mp4")

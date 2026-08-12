@@ -33,7 +33,11 @@ def test_pending_queue_is_capped(tmp_path):
     downloads = tmp_path / "dl"
     downloads.mkdir()
     store = PendingStore(str(tmp_path / "p.json"), str(downloads), max_items=10)
-    ids = [store.add(f"منشور {i}") for i in range(40)]
+    ids = []
+    for i in range(40):
+        item_id = store.add(f"منشور {i}")
+        store.update(item_id, review={"chat": 1, "msg": i + 1})
+        ids.append(item_id)
     assert len(store.items) <= 10
     assert store.get(ids[-1]) is not None      # الأحدث محفوظ
     assert store.get(ids[0]) is None           # الأقدم أُزيح
@@ -45,27 +49,42 @@ def test_cap_deletes_evicted_media_files(tmp_path):
     store = PendingStore(str(tmp_path / "p.json"), str(downloads), max_items=2)
     paths = []
     for i in range(5):
-        path = downloads / f"{i}.jpg"
+        path = downloads / f"tg_{i}.jpg"
         path.write_bytes(b"x")
         paths.append(str(path))
-        store.add(f"منشور {i}", [{"path": str(path), "type": "photo"}])
+        item_id = store.add(f"منشور {i}", [{"path": str(path), "type": "photo"}])
+        store.update(item_id, review={"chat": 1, "msg": i + 1})
     assert not os.path.exists(paths[0])        # ملف المُزاح حُذف معه
     assert os.path.exists(paths[-1])
 
 
-# --- حماية التنظيف من مجلد خطير ---
-@pytest.mark.parametrize("bad_dir", ["/", "/etc", "/tmp", "/home"])
-def test_sweep_refuses_system_directories(tmp_path, bad_dir):
-    store = PendingStore(str(tmp_path / "p.json"), bad_dir)
+# --- حماية التنظيف من مجلد غير مُدار (الاختبار كله داخل tmp_path) ---
+def test_sweep_refuses_directory_outside_state_root(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "tg_victim.jpg"
+    victim.write_bytes(b"do not delete")
+    os.utime(victim, (0, 0))
+    store = PendingStore(str(state / "pending.json"), str(outside))
+
     assert store.sweep_orphans() == 0
+    assert victim.read_bytes() == b"do not delete"
 
 
-def test_sweep_refuses_home_directory(tmp_path):
-    store = PendingStore(str(tmp_path / "p.json"), os.path.expanduser("~"))
+def test_sweep_refuses_state_root_itself(tmp_path):
+    victim = tmp_path / "tg_victim.jpg"
+    victim.write_bytes(b"do not delete")
+    os.utime(victim, (0, 0))
+    store = PendingStore(str(tmp_path / "pending.json"), str(tmp_path))
+
     assert store.sweep_orphans() == 0
+    assert victim.read_bytes() == b"do not delete"
 
 
 # --- صلاحيات ملفات الأسرار ---
+@pytest.mark.skipif(os.name != "posix", reason="أوضاع Unix 0600 لا تنطبق على Windows")
 def test_pending_file_is_owner_only(tmp_path):
     downloads = tmp_path / "dl"
     downloads.mkdir()
@@ -74,6 +93,7 @@ def test_pending_file_is_owner_only(tmp_path):
     assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name != "posix", reason="أوضاع Unix 0600 لا تنطبق على Windows")
 def test_touch_private_creates_restricted_file(tmp_path):
     from twitter import _touch_private
 

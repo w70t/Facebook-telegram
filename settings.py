@@ -76,8 +76,10 @@ class Settings:
         self.data["api_hash"] = self.data.get("api_hash") or os.environ.get("API_HASH")
         self.data["bot_token"] = self.data.get("bot_token") or os.environ.get("BOT_TOKEN")
 
-    def save(self):
+    def _commit(self, data):
+        """يكتب نسخة مرشّحة أولاً، ثم يبدّل الحالة في الذاكرة بعد النجاح."""
         with self._lock:
+            candidate = copy.deepcopy(data)
             # نحتفظ بآخر نسخة سليمة قبل الاستبدال — تُستخدم للاسترجاع لو تلف الملف
             if os.path.exists(self.path):
                 try:
@@ -86,11 +88,21 @@ class Settings:
                 except OSError:
                     pass
             # الملف يحتوي أسرارًا (توكن فيسبوك/كلمات مرور X) — قراءة المالك فقط
-            atomic_write_json(self.path, self.data, mode=0o600)
+            atomic_write_json(self.path, candidate, mode=0o600)
+            self.data = candidate
+
+    def save(self):
+        """يحفظ تعديلات مباشرة متعمّدة (يستخدمه configure.py)."""
+        self._commit(self.data)
+
+    def _replace(self, key, value):
+        candidate = copy.deepcopy(self.data)
+        candidate[key] = value
+        self._commit(candidate)
 
     # --- وصول عام ---
     def get(self, key, default=None):
-        return self.data.get(key, default)
+        return copy.deepcopy(self.data.get(key, default))
 
     def get_int(self, key, default):
         """يقرأ قيمة رقمية بأمان — قيمة تالفة في الملف لا توقف البوت."""
@@ -102,8 +114,14 @@ class Settings:
 
     def set(self, key, value):
         with self._lock:
-            self.data[key] = value
-            self.save()
+            self._replace(key, value)
+
+    def set_many(self, values):
+        """يثبّت عدة مفاتيح معاً؛ إمّا كلها أو لا شيء."""
+        with self._lock:
+            candidate = copy.deepcopy(self.data)
+            candidate.update(values)
+            self._commit(candidate)
 
     # --- بوت جاهز للتشغيل؟ ---
     def bootstrap_ready(self):
@@ -118,19 +136,18 @@ class Settings:
             ids = list(self.data.get("admin_ids") or [])
             if uid not in ids:
                 ids.append(uid)
-                self.data["admin_ids"] = ids
-                self.save()
+                self._replace("admin_ids", ids)
 
     def remove_admin(self, uid):
         with self._lock:
-            self.data["admin_ids"] = [
+            ids = [
                 i for i in (self.data.get("admin_ids") or []) if i != uid
             ]
-            self.save()
+            self._replace("admin_ids", ids)
 
     # --- القنوات المصدر ---
     def sources(self):
-        return list(self.data.get("sources") or [])
+        return copy.deepcopy(self.data.get("sources") or [])
 
     def source_ids(self):
         return {s["id"] for s in self.sources()}
@@ -141,8 +158,7 @@ class Settings:
             if any(s["id"] == peer_id for s in srcs):
                 return False
             srcs.append({"id": peer_id, "title": title, "input": raw})
-            self.data["sources"] = srcs
-            self.save()
+            self._replace("sources", srcs)
             return True
 
     def remove_source(self, peer_id=None, raw=None):
@@ -154,13 +170,12 @@ class Settings:
                         or (raw is not None and (s["input"] == raw or s["title"] == raw)))
             ]
             removed = len(srcs) - len(kept)
-            self.data["sources"] = kept
-            self.save()
+            self._replace("sources", kept)
             return removed
 
     # --- فلترة الكلمات ---
     def filter_words(self):
-        return list(self.data.get("filter_words") or [])
+        return copy.deepcopy(self.data.get("filter_words") or [])
 
     def add_filter_word(self, word):
         with self._lock:
@@ -169,8 +184,7 @@ class Settings:
                 return False
             words = self.filter_words()
             words.append(word)
-            self.data["filter_words"] = words
-            self.save()
+            self._replace("filter_words", words)
             return True
 
     def remove_filter_word(self, word):
@@ -178,8 +192,7 @@ class Settings:
             words = self.filter_words()
             kept = [w for w in words if w.lower() != word.strip().lower()]
             removed = len(words) - len(kept)
-            self.data["filter_words"] = kept
-            self.save()
+            self._replace("filter_words", kept)
             return removed
 
     def is_filtered(self, text):
@@ -192,7 +205,7 @@ class Settings:
 
     # --- حسابات دخول X (مجموعة، مع تبديل تلقائي عند الحظر) ---
     def x_logins(self):
-        return list(self.data.get("x_logins") or [])
+        return copy.deepcopy(self.data.get("x_logins") or [])
 
     def x_login_ready(self):
         return any(not lg.get("failed") for lg in self.x_logins())
@@ -206,16 +219,14 @@ class Settings:
             logins.insert(0, {
                 "username": username, "email": email, "password": password, "failed": False,
             })
-            self.data["x_logins"] = logins
-            self.save()
+            self._replace("x_logins", logins)
 
     def remove_x_login(self, username):
         with self._lock:
             logins = self.x_logins()
             kept = [lg for lg in logins if lg["username"].lower() != username.lower()]
             removed = len(logins) - len(kept)
-            self.data["x_logins"] = kept
-            self.save()
+            self._replace("x_logins", kept)
             return removed
 
     def active_x_login(self):
@@ -232,8 +243,7 @@ class Settings:
                 return False
             rest = [lg for lg in logins if lg["username"].lower() != username.lower()]
             chosen[0]["failed"] = False
-            self.data["x_logins"] = chosen + rest
-            self.save()
+            self._replace("x_logins", chosen + rest)
             return True
 
     def mark_x_login_failed(self, username, failed=True):
@@ -242,20 +252,18 @@ class Settings:
             for lg in logins:
                 if lg["username"].lower() == username.lower():
                     lg["failed"] = failed
-            self.data["x_logins"] = logins
-            self.save()
+            self._replace("x_logins", logins)
 
     def reset_x_failures(self):
         with self._lock:
             logins = self.x_logins()
             for lg in logins:
                 lg["failed"] = False
-            self.data["x_logins"] = logins
-            self.save()
+            self._replace("x_logins", logins)
 
     # --- الحسابات المتابَعة ---
     def x_accounts(self):
-        return list(self.data.get("x_accounts") or [])
+        return copy.deepcopy(self.data.get("x_accounts") or [])
 
     def add_x_account(self, screen_name, user_id, last_id=None):
         """
@@ -271,8 +279,7 @@ class Settings:
                 "user_id": user_id,
                 "last_id": str(last_id) if last_id is not None else None,
             })
-            self.data["x_accounts"] = accs
-            self.save()
+            self._replace("x_accounts", accs)
             return True
 
     def remove_x_account(self, screen_name):
@@ -280,8 +287,7 @@ class Settings:
             accs = self.x_accounts()
             kept = [a for a in accs if a["screen_name"].lower() != screen_name.lower()]
             removed = len(accs) - len(kept)
-            self.data["x_accounts"] = kept
-            self.save()
+            self._replace("x_accounts", kept)
             return removed
 
     def set_x_last_id(self, screen_name, last_id):
@@ -289,6 +295,14 @@ class Settings:
             accs = self.x_accounts()
             for a in accs:
                 if a["screen_name"].lower() == screen_name.lower():
+                    current = a.get("last_id")
+                    try:
+                        # معرّفات X الرقمية تصاعدية؛ replay لتغريدة قديمة لا
+                        # يجوز أن يرجع المؤشر للخلف فيعيد تغريدات أحدث.
+                        if current is not None and int(last_id) <= int(current):
+                            continue
+                    except (TypeError, ValueError):
+                        if str(last_id) == str(current):
+                            continue
                     a["last_id"] = str(last_id)
-            self.data["x_accounts"] = accs
-            self.save()
+            self._replace("x_accounts", accs)

@@ -30,6 +30,15 @@ class FacebookAuthError(FacebookError):
     """
 
 
+class FacebookUncertainError(FacebookError):
+    """
+    نتيجة POST غير محسومة.
+
+    عند انقطاع الاتصال أو رد 5xx قد يكون Facebook نفّذ الطلب ثم ضاعت الاستجابة.
+    إعادة POST تلقائياً قد تنشئ نسخة ثانية، لذلك يجب أن يحسمه الأدمن يدوياً.
+    """
+
+
 class FacebookPublisher:
     def __init__(self, page_id, access_token, timeout=120, version=DEFAULT_VERSION,
                  retries=3):
@@ -113,10 +122,12 @@ class FacebookPublisher:
 
     # --- الطبقة الدنيا ---
     def _request(self, url, data, file_path=None, method="POST"):
+        is_get = method == "GET"
+        attempts = self.retries if is_get else 1
         last_error = None
-        for attempt in range(self.retries):
+        for attempt in range(attempts):
             try:
-                if method == "GET":
+                if is_get:
                     resp = requests.get(url, params=data, timeout=self.timeout)
                 elif file_path:
                     with open(file_path, "rb") as f:
@@ -126,20 +137,37 @@ class FacebookPublisher:
                 else:
                     resp = requests.post(url, data=data, timeout=self.timeout)
             except requests.RequestException as e:
-                last_error = FacebookError(f"تعذّر الاتصال بفيسبوك: {e}")
+                message = f"تعذّر الاتصال بفيسبوك: {e}"
+                if not is_get:
+                    raise FacebookUncertainError(message) from e
+                last_error = FacebookError(message)
             else:
                 try:
-                    return self._handle(resp)
+                    result = self._handle(resp)
+                    if not is_get and not result.get("id"):
+                        raise FacebookUncertainError(
+                            "رد Facebook الناجح لا يحتوي معرّف المنشور"
+                        )
+                    return result
                 except FacebookAuthError:
                     raise                       # لا فائدة من إعادة المحاولة
                 except FacebookError as e:
+                    # POST أعاد 2xx لكن الرد غير قابل للفهم/ناقص: قد يكون
+                    # المنشور أُنشئ فعلاً، فلا نعلن فشلاً قطعياً يسمح بالتكرار.
+                    if not is_get and resp.status_code < 400:
+                        raise FacebookUncertainError(str(e)) from e
                     if not getattr(e, "transient", False):
                         raise
+                    if not is_get:
+                        raise FacebookUncertainError(str(e)) from e
                     last_error = e
 
-            if attempt < self.retries - 1:
+            if attempt < attempts - 1:
                 delay = 2 ** attempt
-                log.warning("فشل مؤقت مع فيسبوك (%s) — إعادة بعد %ss", last_error, delay)
+                log.warning(
+                    "فشل GET مؤقت مع فيسبوك (%s) — إعادة بعد %ss",
+                    last_error, delay,
+                )
                 time.sleep(delay)
         raise last_error
 

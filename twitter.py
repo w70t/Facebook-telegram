@@ -8,7 +8,9 @@ import logging
 import os
 import re
 
-from settings import BASE_DIR
+from settings import SETTINGS_FILE
+
+BASE_DIR = os.path.dirname(os.path.abspath(SETTINGS_FILE))
 
 log = logging.getLogger("tg2fb.x")
 
