@@ -53,14 +53,16 @@ class FakeLocator:
 
     def _visible(self):
         state = self.page.state
-        if self.kind in {"form", "form_buttons"}:
+        if self.kind == "form":
             return True
+        if self.kind == "form_buttons":
+            return self.page.form_submit_count > 0
         if self.selector == "body":
             return True
         if self.selector == xbrowser.USERNAME_SELECTOR:
-            return state in {"username", "static"}
+            return state in {"username", "jf_username", "static"}
         if self.selector == xbrowser.PASSWORD_SELECTOR:
-            return state in {"password", "static"}
+            return state in {"password", "jf_username", "static"}
         if self.selector == xbrowser.GENERIC_INPUT_SELECTOR:
             return (
                 state in {
@@ -82,8 +84,16 @@ class FakeLocator:
 
     async def count(self):
         if self.kind == "form_buttons":
-            return 1
+            return self.page.form_submit_count
         return int(self._visible())
+
+    def nth(self, _index):
+        return self
+
+    async def evaluate(self, _expression):
+        if self.selector == xbrowser.PASSWORD_SELECTOR and self.page.state == "jf_username":
+            return False
+        return self._visible()
 
     async def is_visible(self):
         return self._visible()
@@ -109,7 +119,10 @@ class FakeLocator:
         )
 
     async def click(self, **_kwargs):
+        if _kwargs.get("trial"):
+            return
         self.page.clicks.append(self.page.state)
+        self.page.clicked_locators.append((self.kind, self.selector))
         if not self.page.stages:
             raise RuntimeError("no next stage")
         self.page.advance(self.page.stages.pop(0))
@@ -135,7 +148,7 @@ class FakeLocator:
     def locator(self, selector):
         if selector == "xpath=ancestor::form[1]":
             return FakeLocator(self.page, selector, kind="form")
-        if self.kind == "form" and selector == "button:visible":
+        if self.kind == "form" and selector == xbrowser.LOGIN_SELECTOR:
             return FakeLocator(self.page, selector, kind="form_buttons")
         return FakeLocator(self.page, selector)
 
@@ -153,6 +166,7 @@ class FakePage:
         block_close=False,
         transition_delay=0,
         url_changes_before_dom=False,
+        form_submit_count=1,
     ):
         self.state = "new"
         self.stages = list(stages)
@@ -176,6 +190,8 @@ class FakePage:
         self.field_values = {}
         self.hide_generic = False
         self.fail_transition_evaluate = False
+        self.form_submit_count = form_submit_count
+        self.clicked_locators = []
 
     def advance(self, next_state):
         async def later():
@@ -316,6 +332,7 @@ def fake_runtime(
     fail_context_close=False,
     fail_browser_close=False,
     fail_manager_stop=False,
+    form_submit_count=1,
 ):
     events = []
     page = FakePage(
@@ -327,6 +344,7 @@ def fake_runtime(
         block_close=block_page_close,
         transition_delay=transition_delay,
         url_changes_before_dom=url_changes_before_dom,
+        form_submit_count=form_submit_count,
     )
     context = FakeContext(page, events, cookies=cookies, fail_close=fail_context_close)
     browser = FakeBrowser(context, events, fail_close=fail_browser_close)
@@ -349,6 +367,44 @@ def run_login(factory, handler, credentials=None, **kwargs):
     ))
 
 
+def test_jf_password_decoy_is_visible_but_not_actionable():
+    _factory, page, _browser, _events = fake_runtime(
+        [], initial_state="jf_username",
+    )
+    page.state = "jf_username"
+    password = page.locator(xbrowser.PASSWORD_SELECTOR).first
+
+    assert asyncio.run(password.is_visible()) is True
+    assert asyncio.run(xbrowser._is_actionable(password)) is False
+
+
+def test_actionability_defers_ancestor_pointer_targeting_to_trial_click():
+    class AncestorPointerLocator:
+        async def evaluate(self, expression):
+            # The regression contract is visible in the reviewed JS: an
+            # ancestor may disable its own hit target while a child restores
+            # pointer-events:auto. Playwright's trial click is authoritative.
+            assert "current === node && style.pointerEvents === 'none'" in expression
+            return True
+
+        async def click(self, *, trial, timeout):
+            assert trial is True
+            assert timeout == 1_000
+
+    assert asyncio.run(
+        xbrowser._is_actionable(AncestorPointerLocator())
+    ) is True
+
+
+def test_current_jf_failure_messages_are_classified_without_remote_details():
+    assert xbrowser._classify_text(
+        "We couldn't find an active X account with that username."
+    ) == "credentials"
+    assert xbrowser._classify_text(
+        "We’ve temporarily limited your login. Please try again later."
+    ) == "rate_limited"
+
+
 def test_browser_login_without_challenge_returns_memory_cookies_and_closes_all():
     factory, page, browser, events = fake_runtime(["password", "success"])
 
@@ -369,7 +425,36 @@ def test_current_static_full_form_fills_both_fields_then_submits_once():
 
     assert result["auth_token"] == "auth-value"
     assert page.fills == [("static", "reader"), ("static", "account-password")]
-    assert page.clicks == [("static", "Enter")]
+    assert page.clicks == ["static"]
+    assert page.clicked_locators == [("form_buttons", xbrowser.LOGIN_SELECTOR)]
+    assert events[-1] == "manager.stop"
+
+
+def test_current_jf_form_ignores_password_decoy_then_submits_each_real_step():
+    factory, page, _browser, events = fake_runtime(
+        ["password", "success"], initial_state="jf_username",
+    )
+
+    result = run_login(factory, lambda *_args: None)
+
+    assert result["auth_token"] == "auth-value"
+    assert page.fills == [
+        ("jf_username", "reader"),
+        ("password", "account-password"),
+    ]
+    assert page.clicks == ["jf_username", "password"]
+    assert events[-1] == "manager.stop"
+
+
+def test_static_full_form_rejects_ambiguous_submit_controls():
+    factory, page, _browser, events = fake_runtime(
+        ["success"], initial_state="static", form_submit_count=2,
+    )
+
+    with pytest.raises(xbrowser.XBrowserPageChanged, match="submit control"):
+        run_login(factory, lambda *_args: None)
+
+    assert page.clicks == []
     assert events[-1] == "manager.stop"
 
 

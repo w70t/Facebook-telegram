@@ -1540,6 +1540,25 @@ def test_x_login_failure_is_sanitized_and_does_not_persist(app, monkeypatch):
     assert all("secret server detail" not in reply for reply in password_event.responses)
 
 
+def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch):
+    async def fake_login(_credentials, _challenge_handler):
+        raise app.XBrowserRateLimited("fixed internal detail")
+
+    monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
+    password_event = Event(text="do-not-save")
+
+    asyncio.run(app._save_x_login(
+        password_event,
+        {"x_username": "reader", "x_email": None},
+        password_event.text,
+    ))
+
+    assert app.S.x_logins() == []
+    assert password_event.deleted is True
+    assert any("مؤقتاً" in reply and "انتظر" in reply for reply in password_event.responses)
+    assert all("fixed internal detail" not in reply for reply in password_event.responses)
+
+
 def test_second_admin_cannot_overlap_x_login_attempt(app):
     app.S.add_admin(84)
     second = Event(text="second-password", sender_id=84)

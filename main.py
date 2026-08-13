@@ -43,6 +43,7 @@ from xbrowser import (
     XBrowserChallengeRejected,
     XBrowserCredentialsRejected,
     XBrowserPageChanged,
+    XBrowserRateLimited,
     XBrowserSessionError,
     XBrowserUnavailable,
     XBrowserUnsupportedChallenge,
@@ -2645,6 +2646,11 @@ async def _save_x_login(event, st, password):
         await event.respond(
             "⚠️ طلب X CAPTCHA أو مفتاح أمان/تأكيداً غير مدعوم. لن يحاول البوت "
             "تجاوزه؛ أكمله من موقع X الرسمي ثم أعد المحاولة."
+        )
+    except XBrowserRateLimited:
+        await event.respond(
+            "⏳ أوقف X محاولات الدخول مؤقتاً. أُغلق المتصفح ولم تُحفظ جلسة؛ "
+            "انتظر قليلاً ثم أعد المحاولة."
         )
     except XBrowserUnavailable:
         await event.respond(
