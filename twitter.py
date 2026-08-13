@@ -7,6 +7,7 @@
 import logging
 import os
 import re
+import tempfile
 
 from settings import SETTINGS_FILE
 
@@ -14,20 +15,32 @@ BASE_DIR = os.path.dirname(os.path.abspath(SETTINGS_FILE))
 
 log = logging.getLogger("tg2fb.x")
 
-# كلمات تدل على مشكلة مصادقة/حظر (لتمييزها عن أخطاء الشبكة العابرة).
-# \b ضرورية: بدونها كان "bandwidth" و"banner" يطابقان "ban" فيُحرق حساب سليم.
+# لا نعلّم الحساب failed إلا عند دليل قطعي على بيانات اعتماد خاطئة أو تعطيل الحساب.
+# 403/Forbidden وblocked/denied قد تكون قيود endpoint أو rate-limit وليست دليلاً.
 AUTH_HINTS = re.compile(
-    r"\b(?:401|403|unauthoriz\w*|forbidden|suspend\w*|banned|ban|locked|"
-    r"could not authenticate|denied|blocked|not\s+authorized|"
-    r"invalid\s+token|bad\s+token|login\s+required|session\s+expired)\b",
+    r"\b(?:401\s+unauthoriz\w*|invalid\s+(?:credentials|password)|"
+    r"incorrect\s+password|wrong\s+password|could not authenticate|"
+    r"account\s+(?:(?:is|has\s+been)\s+)?(?:suspend\w*|locked)|"
+    r"suspended\s+account)\b",
     re.I,
 )
 
-# أسماء استثناءات twikit التي تعني قطعاً مشكلة حساب لا مشكلة شبكة
+# أسماء استثناءات twikit التي تعني قطعاً مشكلة اعتماد/حساب لا مشكلة endpoint.
 AUTH_EXC_NAMES = {
-    "Unauthorized", "Forbidden", "AccountSuspended", "AccountLocked",
-    "UserUnavailable", "CouldNotTweet",
+    "Unauthorized", "AccountSuspended", "AccountLocked",
 }
+
+ACCOUNT_DISABLED_EXC_NAMES = {"AccountSuspended", "AccountLocked"}
+ACCOUNT_DISABLED_HINTS = re.compile(
+    r"\b(?:account\s+(?:(?:is|has\s+been)\s+)?(?:suspend\w*|locked)|"
+    r"suspended\s+account)\b",
+    re.I,
+)
+SESSION_INVALID_HINTS = re.compile(
+    r"\b(?:401|unauthoriz\w*|invalid\s+token|bad\s+token|"
+    r"login\s+required|session\s+expired|could not authenticate)\b",
+    re.I,
+)
 
 
 def _cookies_path(username):
@@ -35,19 +48,79 @@ def _cookies_path(username):
     return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
 
 
-def _touch_private(path):
-    """ينشئ الملف فارغاً بصلاحيات 600 قبل أن تكتب فيه المكتبة."""
-    try:
-        os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
-    except OSError as e:
-        log.warning("تعذّر تهيئة ملف الكوكيز %s: %s", path, e)
-
-
-def _restrict(path):
+def _restrict(path, *, required=False):
     try:
         os.chmod(path, 0o600)
-    except OSError:
-        pass
+    except OSError as e:
+        if required:
+            log.warning("تعذّر تقييد ملف كوكيز X (%s)", type(e).__name__)
+            raise
+
+
+def _save_cookies_atomic(client, path):
+    """يحفظ جلسة X كاملة ذرّياً، مع إبقاء الجلسة السابقة عند فشل الكتابة."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, temp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=".x-cookies-",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    try:
+        # mkstemp خاص افتراضياً على POSIX، ونطبّق القيد صراحة قبل وبعد كتابة Twikit.
+        _restrict(temp_path, required=True)
+        client.save_cookies(temp_path)
+        _restrict(temp_path, required=True)
+        # Windows يتطلب مقبضاً قابلاً للكتابة كي يقبل fsync.
+        with open(temp_path, "r+b") as cookie_file:
+            os.fsync(cookie_file.fileno())
+        os.replace(temp_path, path)
+        _restrict(path)
+
+        # ثبّت إدخال الدليل على Raspberry Pi قدر الإمكان. بعض المنصات (Windows)
+        # لا تسمح بفتح الدليل، لذا لا نحول نجاح الاستبدال الذري إلى فشل كاذب.
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def _cleanup_cookie_temps(directory=None):
+    """يحذف بقايا كتابة جلسات X بعد crash، دون اتباع روابط رمزية."""
+    directory = os.path.abspath(directory or BASE_DIR)
+    try:
+        entries = os.scandir(directory)
+    except OSError as e:
+        log.warning("تعذّر فحص بقايا جلسات X (%s)", type(e).__name__)
+        return 0
+
+    removed = 0
+    with entries:
+        for entry in entries:
+            if not (
+                entry.name.startswith(".x-cookies-")
+                and entry.name.endswith(".tmp")
+            ):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                os.remove(entry.path)
+                removed += 1
+            except OSError as e:
+                log.warning("تعذّر حذف بقايا جلسة X (%s)", type(e).__name__)
+    if removed:
+        log.info("حُذفت %d من بقايا ملفات جلسات X المؤقتة", removed)
+    return removed
 
 
 def _drop_cookies(username):
@@ -58,15 +131,33 @@ def _drop_cookies(username):
     path = _cookies_path(username)
     try:
         os.remove(path)
-        log.info("حُذفت كوكيز X المنتهية لـ %s", username)
-    except OSError:
-        pass
+        log.info("حُذفت كوكيز X غير الصالحة")
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        log.warning("تعذّر حذف ملف جلسة X (%s)", type(e).__name__)
+        return False
 
 
 def is_auth_error(exc):
     if type(exc).__name__ in AUTH_EXC_NAMES:
         return True
     return bool(AUTH_HINTS.search(str(exc)))
+
+
+def _is_account_disabled(exc):
+    return (
+        type(exc).__name__ in ACCOUNT_DISABLED_EXC_NAMES
+        or bool(ACCOUNT_DISABLED_HINTS.search(str(exc)))
+    )
+
+
+def _is_session_invalid(exc):
+    return (
+        type(exc).__name__ in AUTH_EXC_NAMES
+        or bool(SESSION_INVALID_HINTS.search(str(exc)))
+    )
 
 
 def is_newer(tweet_id, last_id):
@@ -85,6 +176,7 @@ def is_newer(tweet_id, last_id):
 
 class XReader:
     def __init__(self, settings):
+        _cleanup_cookie_temps()
         self.S = settings
         self.client = None
         self.active = None      # اسم الحساب النشط حالياً
@@ -101,6 +193,13 @@ class XReader:
         self.active = None
         self.ready = False
 
+    def discard_session(self, username):
+        """يحذف جلسة دخول لم نستطع تثبيت إعداداتها محلياً."""
+        removed = _drop_cookies(username)
+        if self.active and self.active.lower() == str(username).lower():
+            self.invalidate()
+        return removed
+
     @staticmethod
     async def _verify(client, username):
         """
@@ -113,65 +212,137 @@ class XReader:
             return
         await client.get_user_by_screen_name(username)
 
-    async def _activate(self, cred):
-        username = cred["username"]
-        client = self._new_client()
-        cpath = _cookies_path(username)
-        authenticated = False
-
-        if os.path.exists(cpath):
-            try:
-                _restrict(cpath)          # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
-                client.load_cookies(cpath)
-                await self._verify(client, username)
-                authenticated = True
-            except Exception as e:  # noqa: BLE001
-                log.warning("كوكيز X لـ %s غير صالحة (%s) — إعادة تسجيل دخول", username, e)
-                _drop_cookies(username)
-                client = self._new_client()
-
-        if not authenticated:
-            await client.login(
-                auth_info_1=username,
-                auth_info_2=cred.get("email") or username,
-                password=cred["password"],
-            )
-            # الكوكيز = جلسة دخول X كاملة. ننشئ الملف بصلاحيات مقيّدة *قبل*
-            # الكتابة؛ الاكتفاء بـ chmod بعدها يترك نافذة يكون فيها 0644.
-            _touch_private(cpath)
-            client.save_cookies(cpath)
-            _restrict(cpath)
-
+    def _set_active(self, client, username):
         self.client = client
         self.active = username
         self.ready = True
-        log.info("حساب X النشط: %s", username)
+        log.info("تم تفعيل جلسة X")
 
-    async def ensure_login(self):
-        """يضمن جلسة صالحة، ويتنقّل بين الحسابات عند فشل الدخول."""
+    def _mark_failed_if_auth(self, username, exc, *, drop_cookies=False):
+        """لا يحرق حساباً بسبب timeout/challenge/network عابر."""
+        if not is_auth_error(exc):
+            return False
+        if drop_cookies:
+            _drop_cookies(username)
+        self.S.mark_x_login_failed(username, True)
+        return True
+
+    async def _activate_cookie(self, cred):
+        """يحمّل جلسة موجودة فقط؛ لا يلمس كلمة المرور أو مدخلات Twikit."""
+        username = cred["username"]
+        cpath = _cookies_path(username)
+        if not os.path.exists(cpath):
+            return False
+        client = self._new_client()
+        _restrict(cpath)              # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
+        client.load_cookies(cpath)
+        await self._verify(client, username)
+        self._set_active(client, username)
+        return True
+
+    @staticmethod
+    def _validate_credential(cred):
+        if not isinstance(cred, dict):
+            raise TypeError("بيانات دخول X يجب أن تكون قاموساً")
+        username = str(cred.get("username") or "").strip().lstrip("@")
+        password = cred.get("password")
+        if not username or not password:
+            raise ValueError("اسم مستخدم X وكلمة المرور مطلوبان")
+        return username, cred.get("email") or username, password
+
+    async def login_interactive(self, cred, challenge_handler):
+        """
+        تسجيل صريح يتيح للواجهة طلب 2FA/challenges من المستخدم عبر callback.
+
+        لا تُحفظ الكوكيز ولا تصبح الجلسة نشطة إلا بعد نجاح تسجيل الدخول ثم نداء
+        تحقق مستقل. استيراد xauth كسول كي يبقى poller خالياً تماماً من أي مسار
+        قد يطلب password/input.
+        """
+        if not callable(challenge_handler):
+            raise TypeError("challenge_handler يجب أن يكون callable")
+        username, auth_info_2, password = self._validate_credential(cred)
+        client = self._new_client()
+        try:
+            from xauth import login_with_challenges
+
+            await login_with_challenges(
+                client,
+                auth_info_1=username,
+                auth_info_2=auth_info_2,
+                password=password,
+                challenge_handler=challenge_handler,
+            )
+            await self._verify(client, username)
+        except Exception as e:  # noqa: BLE001
+            self._mark_failed_if_auth(username, e)
+            log.warning("فشل تسجيل X التفاعلي (%s)", type(e).__name__)
+            raise
+
+        cpath = _cookies_path(username)
+        try:
+            # الكوكيز = جلسة دخول X كاملة. نكتب ملفاً مؤقتاً خاصاً بعد verify ثم
+            # نستبدل الملف النهائي ذرّياً، فلا نفقد جلسة سابقة عند فشل القرص.
+            _save_cookies_atomic(client, cpath)
+        except Exception as e:  # noqa: BLE001
+            log.warning("تعذّر حفظ جلسة X المتحققة (%s)", type(e).__name__)
+            raise
+
+        self._set_active(client, username)
+        return True
+
+    async def ensure_login(self, interactive=False, challenge_handler=None):
+        """
+        يفعّل كوكيز صالحة في الخلفية دون تسجيل بكلمة مرور أو طلب إدخال.
+
+        ``interactive=True`` متاح للتوافق فقط، ويتطلب callback صريحاً ويمر عبر
+        login_interactive؛ الاستدعاء الافتراضي الذي يستخدمه poller cookie-only.
+        """
         if self.ready and self.client:
             return True
-        for cred in self.S.x_logins():
+        credentials = self.S.x_logins()
+        disabled = set()
+        for cred in credentials:
             if cred.get("failed"):
                 continue
             try:
-                await self._activate(cred)
-                return True
+                if await self._activate_cookie(cred):
+                    return True
             except Exception as e:  # noqa: BLE001
-                log.warning("فشل دخول X %s: %s", cred["username"], e)
-                _drop_cookies(cred["username"])
-                self.S.mark_x_login_failed(cred["username"], True)
+                # 401/session-expired يبطل الجلسة فقط؛ لا يثبت أن كلمة المرور
+                # خاطئة. قفل/تعليق الحساب وحده يبرر failed في مسار الخلفية.
+                if _is_session_invalid(e):
+                    _drop_cookies(cred["username"])
+                if _is_account_disabled(e):
+                    self.S.mark_x_login_failed(cred["username"], True)
+                    disabled.add(cred["username"])
+                log.warning("فشل التحقق من كوكيز X (%s)", type(e).__name__)
                 self.invalidate()
+
+        if interactive:
+            if not callable(challenge_handler):
+                raise TypeError(
+                    "challenge_handler مطلوب عند interactive=True"
+                )
+            for cred in credentials:
+                if not cred.get("failed") and cred["username"] not in disabled:
+                    return await self.login_interactive(cred, challenge_handler)
         return False
 
     def report_failure(self, exc):
-        """يُستدعى عند خطأ أثناء الجلب: يعلّم الحساب النشط كمحظور إن كان خطأ مصادقة."""
-        if self.active and is_auth_error(exc):
-            _drop_cookies(self.active)
-            self.S.mark_x_login_failed(self.active, True)
-            self.invalidate()
-            return True
-        return False
+        """يعالج فشل جلسة الجلب دون الخلط بين cookie ميتة وحساب معطّل."""
+        session_invalid = _is_session_invalid(exc)
+        definitive_auth = is_auth_error(exc)
+        if not self.active or not (session_invalid or definitive_auth):
+            return False
+        username = self.active
+        _drop_cookies(username)
+        # 401/session-expired أثناء الجلب يثبت بطلان cookie لا بطلان كلمة
+        # المرور. أما قفل الحساب أو رسالة credentials/password الصريحة فقط
+        # فتسمح بتعطيل بيانات الاعتماد المخزنة.
+        if _is_account_disabled(exc) or (definitive_auth and not session_invalid):
+            self.S.mark_x_login_failed(username, True)
+        self.invalidate()
+        return True
 
     async def resolve(self, screen_name):
         if not await self.ensure_login():
@@ -187,7 +358,7 @@ class XReader:
         try:
             tweets = await self.client.get_user_tweets(user_id, "Tweets", count=1)
         except Exception as e:  # noqa: BLE001
-            log.warning("تعذّر جلب أحدث تغريدة لـ %s: %s", user_id, e)
+            log.warning("تعذّر جلب أحدث تغريدة من X (%s)", type(e).__name__)
             return None
         for tw in tweets:
             return str(tw.id)

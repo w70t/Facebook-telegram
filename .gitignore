@@ -14,6 +14,8 @@ sources.json
 # كوكيز X — كل حساب في ملف باسمه: x_cookies_<username>.json
 # النمط القديم (x_cookies.json) لم يكن يطابقها، فكانت جلسات X تُرفع إلى GitHub.
 x_cookies*.json
+# ملفات الكتابة الذرية قد تبقى بعد SIGKILL/انقطاع الكهرباء وتحوي جلسة كاملة.
+.x-cookies-*.tmp
 
 downloads/
 __pycache__/
