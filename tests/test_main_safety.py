@@ -641,6 +641,472 @@ def test_x_login_cannot_start_in_group(app):
     assert any(alert for _text, alert in event.answers)
 
 
+def test_x_email_step_shows_visible_skip_and_cancel_buttons(app):
+    async def scenario():
+        await app.on_xlogin(Event(data=b"xlog:add"))
+        username = Event(text="reader")
+        await app.on_text(username)
+        return username
+
+    username = asyncio.run(scenario())
+    assert app._get_state(42)["action"] == "x_email"
+    buttons = username.response_buttons[-1]
+    assert [button.text for row in buttons for button in row] == [
+        "⏭️ تخطي البريد", "🛑 إلغاء",
+    ]
+    assert [button.data for row in buttons for button in row] == [
+        f"xsetup:{app._get_state(42)['x_setup_id']}:skip_email".encode(),
+        f"xsetup:{app._get_state(42)['x_setup_id']}:cancel".encode(),
+    ]
+    assert all(len(button.data) <= 64 for row in buttons for button in row)
+    assert "`-`" not in username.responses[-1]
+
+
+def test_x_email_skip_button_advances_without_typed_dash(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    event = Event(data=f"xsetup:{setup_id}:skip_email".encode())
+    asyncio.run(app.on_xsetup(event))
+
+    st = app._get_state(42)
+    assert st["action"] == "x_pass"
+    assert st["x_username"] == "reader"
+    assert st["x_email"] is None
+    assert any(text == "تم تخطي البريد" and not alert for text, alert in event.answers)
+    assert "كلمة مرور" in event.responses[-1]
+    assert event.response_buttons[-1][0][0].data == b"xsetup:flow-a:cancel"
+
+
+def test_x_setup_cancel_button_clears_private_flow(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    event = Event(data=f"xsetup:{setup_id}:cancel".encode())
+    asyncio.run(app.on_xsetup(event))
+
+    assert app._get_state(42) is None
+    assert (42, 42) in app._x_secret_tombstones
+    assert any("أُلغيت" in response for response in event.responses)
+
+
+def test_x_email_skip_button_is_rejected_outside_original_private_chat(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    event = Event(
+        data=f"xsetup:{setup_id}:skip_email".encode(),
+        chat_id=-100777, is_private=False,
+    )
+    asyncio.run(app.on_xsetup(event))
+
+    assert app._get_state(42)["action"] == "x_email"
+    assert any(alert for _text, alert in event.answers)
+
+
+def test_stale_x_email_skip_button_cannot_change_password_step(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": "reader@example.test",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    event = Event(data=f"xsetup:{setup_id}:skip_email".encode())
+    asyncio.run(app.on_xsetup(event))
+
+    st = app._get_state(42)
+    assert st["action"] == "x_pass"
+    assert st["x_email"] == "reader@example.test"
+    assert any(alert for _text, alert in event.answers)
+
+
+@pytest.mark.parametrize("action", ["skip_email", "cancel"])
+def test_old_x_setup_button_cannot_change_new_flow(app, action):
+    async def scenario():
+        await app.on_xlogin(Event(data=b"xlog:add"))
+        first_username = Event(text="first-reader")
+        await app.on_text(first_username)
+        old_id = app._get_state(42)["x_setup_id"]
+
+        cancel = Event(data=f"xsetup:{old_id}:cancel".encode())
+        await app.on_xsetup(cancel)
+        # يمثّل السر القديم الذي كان في الطريق؛ يستهلكه tombstone بأمان قبل
+        # بدء المحاولة الجديدة.
+        await app.on_text(Event(text="late-old-secret"))
+        await app.on_xlogin(Event(data=b"xlog:add"))
+        second_username = Event(text="second-reader")
+        await app.on_text(second_username)
+        new_state = app._get_state(42)
+        assert new_state["x_setup_id"] != old_id
+
+        stale = Event(data=f"xsetup:{old_id}:{action}".encode())
+        await app.on_xsetup(stale)
+        return new_state, stale
+
+    new_state, stale = asyncio.run(scenario())
+    assert app._get_state(42) is new_state
+    assert new_state["action"] == "x_email"
+    assert new_state["x_username"] == "second-reader"
+    assert any(alert for _text, alert in stale.answers)
+
+
+def test_email_arriving_while_skip_is_in_flight_is_never_a_password(app, monkeypatch):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    submitted = []
+
+    async def forbidden_save(*args):
+        submitted.append(args)
+
+    monkeypatch.setattr(app, "_save_x_login", forbidden_save)
+
+    async def scenario():
+        answer_started = asyncio.Event()
+        release_answer = asyncio.Event()
+        skip = Event(data=f"xsetup:{setup_id}:skip_email".encode())
+
+        async def blocked_answer(text=None, alert=False):
+            answer_started.set()
+            await release_answer.wait()
+            skip.answers.append((text, alert))
+
+        skip.answer = blocked_answer
+        skip_task = asyncio.create_task(app.on_xsetup(skip))
+        await answer_started.wait()
+        assert app._get_state(42)["action"] == "x_pass_pending"
+
+        email = Event(text="reader@example.test")
+        await app.on_text(email)
+        assert email.deleted is True
+        assert submitted == []
+
+        release_answer.set()
+        await skip_task
+        return email
+
+    email = asyncio.run(scenario())
+    assert app._get_state(42)["action"] == "x_pass"
+    assert submitted == []
+    assert any("انتظر" in response for response in email.responses)
+
+
+def test_cancel_during_skip_answer_prevents_password_prompt(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+
+    async def scenario():
+        answer_started = asyncio.Event()
+        release_answer = asyncio.Event()
+        skip = Event(data=f"xsetup:{setup_id}:skip_email".encode())
+
+        async def blocked_answer(text=None, alert=False):
+            answer_started.set()
+            await release_answer.wait()
+            skip.answers.append((text, alert))
+
+        skip.answer = blocked_answer
+        skip_task = asyncio.create_task(app.on_xsetup(skip))
+        await answer_started.wait()
+        cancel = Event(data=f"xsetup:{setup_id}:cancel".encode())
+        await app.on_xsetup(cancel)
+        release_answer.set()
+        await skip_task
+        return skip, cancel
+
+    skip, cancel = asyncio.run(scenario())
+    assert app._get_state(42) is None
+    assert skip.responses == []
+    assert any("أُلغيت" in response for response in cancel.responses)
+
+
+def test_admin_revocation_during_skip_answer_prevents_password_prompt(app, monkeypatch):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    authorized = {"value": True}
+    monkeypatch.setattr(app.S, "is_admin", lambda _uid: authorized["value"])
+
+    async def scenario():
+        answer_started = asyncio.Event()
+        release_answer = asyncio.Event()
+        skip = Event(data=f"xsetup:{setup_id}:skip_email".encode())
+
+        async def blocked_answer(text=None, alert=False):
+            answer_started.set()
+            await release_answer.wait()
+            skip.answers.append((text, alert))
+
+        skip.answer = blocked_answer
+        task = asyncio.create_task(app.on_xsetup(skip))
+        await answer_started.wait()
+        authorized["value"] = False
+        release_answer.set()
+        await task
+        return skip
+
+    skip = asyncio.run(scenario())
+    assert app._get_state(42) is None
+    assert skip.responses == []
+
+
+def test_same_flow_cancel_button_stops_running_x_login(app, monkeypatch):
+    setup_id = "flow-a"
+    login_started = None
+    release_login = None
+    saved = []
+
+    async def fake_login(_credentials, _challenge_handler):
+        login_started.set()
+        await release_login.wait()
+        return True
+
+    monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
+    monkeypatch.setattr(app.S, "add_x_login", lambda *args: saved.append(args))
+
+    async def scenario():
+        nonlocal login_started, release_login
+        login_started = asyncio.Event()
+        release_login = asyncio.Event()
+        password = Event(text="secret-password")
+        task = asyncio.create_task(app._save_x_login(
+            password,
+            {
+                "x_username": "reader",
+                "x_email": None,
+                "x_chat_id": 42,
+                "x_setup_id": setup_id,
+            },
+            password.text,
+        ))
+        await login_started.wait()
+        assert app._get_state(42)["action"] == "x_login_running"
+
+        cancel = Event(data=f"xsetup:{setup_id}:cancel".encode())
+        await app.on_xsetup(cancel)
+        await task
+        return password, cancel
+
+    password, cancel = asyncio.run(scenario())
+    assert password.deleted is True
+    assert app._get_state(42) is None
+    assert saved == []
+    assert any("أُلغيت" in response for response in cancel.responses)
+
+
+def test_typed_dash_remains_a_backward_compatible_email_skip(app):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_email",
+        "x_username": "reader",
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    asyncio.run(app.on_text(Event(text="-")))
+
+    st = app._get_state(42)
+    assert st["action"] == "x_pass"
+    assert st["x_email"] is None
+    assert st["x_setup_id"] == setup_id
+
+
+@pytest.mark.parametrize(
+    ("handler", "data"),
+    [
+        ("on_menu", b"m:fb"),
+        ("on_menu", b"m:login"),
+        ("on_src", b"src:add"),
+        ("on_xlogin", b"xlog:add"),
+        ("on_xlogin", b"xlog:switch"),
+        ("on_xlogin", b"xlog:del"),
+        ("on_xacc", b"xacc:add"),
+        ("on_flt", b"flt:add"),
+        ("on_adm", b"adm:add"),
+        ("on_post_action", b"edit:missing-item"),
+    ],
+)
+def test_other_inline_actions_cannot_overwrite_x_password_state(app, handler, data):
+    setup_id = "flow-a"
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+        "x_setup_id": setup_id,
+    })
+    event = Event(data=data)
+    asyncio.run(getattr(app, handler)(event))
+
+    st = app._get_state(42)
+    assert st["action"] == "x_pass"
+    assert st["x_setup_id"] == setup_id
+    assert any(alert for _text, alert in event.answers)
+
+
+def test_old_challenge_code_cannot_satisfy_new_challenge(app):
+    async def scenario():
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        old_future = loop.create_future()
+        app._x_challenges[(42, 42)] = old_future
+        app._set_state(42, {
+            "action": "x_auth_code",
+            "x_challenge_kind": "two_factor",
+            "x_chat_id": 42,
+            "x_setup_id": "old-flow",
+        })
+        old_state = app._get_state(42)
+        code = Event(text="123456")
+
+        async def blocked_delete():
+            delete_started.set()
+            await release_delete.wait()
+            code.deleted = True
+
+        code.delete = blocked_delete
+        old_submit = asyncio.create_task(
+            app._submit_x_challenge_code(code, old_state, code.text)
+        )
+        await delete_started.wait()
+
+        new_future = loop.create_future()
+        app._x_challenges[(42, 42)] = new_future
+        app._set_state(42, {
+            "action": "x_auth_code",
+            "x_challenge_kind": "two_factor",
+            "x_chat_id": 42,
+            "x_setup_id": "new-flow",
+        })
+        new_state = app._get_state(42)
+        release_delete.set()
+        await old_submit
+        return old_future, new_future, new_state
+
+    old_future, new_future, new_state = asyncio.run(scenario())
+    assert old_future.done() is False
+    assert new_future.done() is False
+    assert app._get_state(42) is new_state
+
+
+def test_old_challenge_delete_failure_warns_without_touching_new_flow(app):
+    async def scenario():
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        old_future = loop.create_future()
+        app._x_challenges[(42, 42)] = old_future
+        app._set_state(42, {
+            "action": "x_auth_code",
+            "x_challenge_kind": "two_factor",
+            "x_chat_id": 42,
+            "x_setup_id": "old-flow",
+        })
+        old_state = app._get_state(42)
+        code = Event(text="123456")
+
+        async def blocked_failed_delete():
+            delete_started.set()
+            await release_delete.wait()
+            raise RuntimeError("delete denied")
+
+        code.delete = blocked_failed_delete
+        old_submit = asyncio.create_task(
+            app._submit_x_challenge_code(code, old_state, code.text)
+        )
+        await delete_started.wait()
+        new_future = loop.create_future()
+        app._x_challenges[(42, 42)] = new_future
+        app._set_state(42, {
+            "action": "x_auth_code",
+            "x_challenge_kind": "two_factor",
+            "x_chat_id": 42,
+            "x_setup_id": "new-flow",
+        })
+        new_state = app._get_state(42)
+        release_delete.set()
+        await old_submit
+        return code, new_future, new_state
+
+    code, new_future, new_state = asyncio.run(scenario())
+    assert new_future.done() is False
+    assert app._get_state(42) is new_state
+    assert any("احذف الرسالة" in response for response in code.responses)
+
+
+@pytest.mark.parametrize("kind", ["menu_login", "source_add"])
+def test_callback_rechecks_x_setup_after_await(app, monkeypatch, kind):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        if kind == "menu_login":
+            app.S.set("user_phone", "+491234")
+            event = Event(data=b"m:login")
+
+            async def blocked_respond(text, buttons=None):
+                event.responses.append(text)
+                event.response_buttons.append(buttons)
+                started.set()
+                await release.wait()
+
+            event.respond = blocked_respond
+            task = asyncio.create_task(app.on_menu(event))
+        else:
+            event = Event(data=b"src:add")
+
+            async def blocked_authorized():
+                started.set()
+                await release.wait()
+                return True
+
+            monkeypatch.setattr(app.user, "is_user_authorized", blocked_authorized)
+            task = asyncio.create_task(app.on_src(event))
+
+        await started.wait()
+        app._set_state(42, {
+            "action": "x_pass",
+            "x_username": "reader",
+            "x_email": None,
+            "x_chat_id": 42,
+            "x_setup_id": "flow-a",
+        })
+        release.set()
+        await task
+        return event
+
+    event = asyncio.run(scenario())
+    assert app._get_state(42)["action"] == "x_pass"
+    assert any(alert for _text, alert in event.answers)
+
+
 def test_x_password_delete_failure_aborts_before_login(app, monkeypatch):
     called = []
 

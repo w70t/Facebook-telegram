@@ -165,6 +165,10 @@ _REPLY_ACTIONS = {
     BTN_CLAIM: "claim",
 }
 _RESERVED_COMMANDS = {"/start", "/panel", "/id", "/cancel", "/claim"}
+X_SETUP_ACTIONS = {
+    "x_user", "x_email", "x_pass_pending", "x_pass",
+    "x_login_running", "x_auth_code",
+}
 
 xreader = XReader(S)
 
@@ -214,7 +218,7 @@ async def _delete_secret_message(event):
 
 def _remember_x_secret_tombstone(uid, st):
     if not st or st.get("action") not in {
-        "x_email", "x_pass", "x_auth_code", "claim_code",
+        "x_email", "x_pass_pending", "x_pass", "x_auth_code", "claim_code",
     }:
         return
     chat_id = st.get("x_chat_id", st.get("claim_chat_id"))
@@ -326,13 +330,86 @@ def _navigation_context_matches(event, current=None):
     return True
 
 
+async def _reject_callback_during_x_setup(event):
+    """يمنع أي Inline button آخر من استبدال إدخال X سري جارٍ."""
+    uid = event.sender_id
+    current = _get_state(uid)
+    task = _x_login_tasks.get(uid)
+    if not (
+        (current or {}).get("action") in X_SETUP_ACTIONS
+        or (task is not None and not task.done())
+    ):
+        return False
+    if not _navigation_context_matches(event, current):
+        text = "استخدم أزرار المحاولة في محادثة البوت الخاصة الأصلية."
+    else:
+        text = "ألغِ محاولة X أولاً بزر «🛑 إلغاء» الظاهر فيها."
+    await event.answer(text, alert=True)
+    return True
+
+
+def _new_x_setup_id():
+    """معرّف قصير يربط كل زر بمحاولة X التي أنشأته."""
+    return secrets.token_hex(6)
+
+
+def _x_setup_buttons(setup_id, *, allow_email_skip=False):
+    rows = []
+    if allow_email_skip:
+        rows.append([Button.inline(
+            "⏭️ تخطي البريد",
+            f"xsetup:{setup_id}:skip_email".encode(),
+        )])
+    rows.append([Button.inline(
+        "🛑 إلغاء",
+        f"xsetup:{setup_id}:cancel".encode(),
+    )])
+    return rows
+
+
+def _set_x_password_pending(uid, st, email):
+    next_state = {
+        "action": "x_pass_pending",
+        "x_username": st.get("x_username"),
+        "x_email": email,
+        "x_chat_id": st.get("x_chat_id"),
+        "x_setup_id": st.get("x_setup_id"),
+    }
+    _set_state(uid, next_state)
+    return state[uid]
+
+
+async def _prompt_x_password(event, pending):
+    """يعرض طلب كلمة المرور ثم يفعّله فقط إن بقيت المحاولة نفسها حيّة."""
+    uid = event.sender_id
+    if state.get(uid) is not pending:
+        return False
+    if not S.is_admin(uid):
+        _cancel_x_login(uid)
+        return False
+    await event.respond(
+        "أرسل **كلمة مرور** حساب X:",
+        buttons=_x_setup_buttons(pending["x_setup_id"]),
+    )
+    if state.get(uid) is not pending:
+        return False
+    if not S.is_admin(uid):
+        _cancel_x_login(uid)
+        return False
+    _set_state(uid, {
+        **{key: value for key, value in pending.items() if key != "ts"},
+        "action": "x_pass",
+    })
+    return True
+
+
 def _require_x_admin(uid):
     if not S.is_admin(uid):
         _cancel_x_login(uid)
         raise PermissionError("X login administrator permission was revoked")
 
 
-async def _wait_for_x_challenge(event, kind, _prompt=""):
+async def _wait_for_x_challenge(event, kind, _prompt="", setup_id=None):
     """يربط تحدي X برسالة الأدمن التالية في المحادثة الخاصة نفسها."""
     if not _is_private_chat(event):
         raise RuntimeError("X login challenges require a private Telegram chat")
@@ -345,11 +422,14 @@ async def _wait_for_x_challenge(event, kind, _prompt=""):
 
     future = asyncio.get_running_loop().create_future()
     _x_challenges[key] = future
+    setup_id = setup_id or _new_x_setup_id()
     _set_state(uid, {
         "action": "x_auth_code",
         "x_challenge_kind": kind,
         "x_chat_id": event.chat_id,
+        "x_setup_id": setup_id,
     })
+    challenge_state = state[uid]
     if kind == "two_factor":
         text = (
             "🔐 افتح تطبيق Authenticator وأرسل **الرمز الحالي من 6 أرقام**.\n"
@@ -362,7 +442,10 @@ async def _wait_for_x_challenge(event, kind, _prompt=""):
             "سأحذف الرسالة فوراً ولن أخزنها. تنتهي المهلة بعد 3 دقائق."
         )
     try:
-        await event.respond(text + "\nللإلغاء اضغط زر «🛑 إلغاء» أسفل خانة الكتابة.")
+        await event.respond(
+            text + "\nللإلغاء اضغط الزر الظاهر أدناه.",
+            buttons=_x_setup_buttons(setup_id),
+        )
         try:
             response = await asyncio.wait_for(future, timeout=X_CHALLENGE_TIMEOUT)
         except asyncio.TimeoutError:
@@ -374,15 +457,33 @@ async def _wait_for_x_challenge(event, kind, _prompt=""):
         if _x_challenges.get(key) is future:
             _x_challenges.pop(key, None)
         current = state.get(uid)
-        if current and current.get("action") == "x_auth_code":
-            _clear_state(uid)
+        if current is challenge_state:
+            task = _x_login_tasks.get(uid)
+            if task is not None and not task.done() and uid not in _x_login_cancelled:
+                _set_state(uid, {
+                    "action": "x_login_running",
+                    "x_chat_id": event.chat_id,
+                    "x_setup_id": setup_id,
+                })
+            else:
+                _clear_state(uid)
 
 
 async def _submit_x_challenge_code(event, st, raw):
     """يسلّم رمزاً مؤقتاً لمحاولة X دون تسجيله أو تخزينه."""
     uid = event.sender_id
     context_ok = _x_private_context_matches(event, st)
+    key = _x_challenge_key(event)
+    original_future = _x_challenges.get(key)
     deleted = await _delete_secret_message(event)
+    # لا نسلّم رمزاً التُقط من محاولة قديمة إلى challenge أحدث في نفس chat.
+    if state.get(uid) is not st or _x_challenges.get(key) is not original_future:
+        if not deleted:
+            await event.respond(
+                "⚠️ لم أستخدم رمز المحاولة القديمة، لكن تعذّر حذفه من Telegram. "
+                "احذف الرسالة الظاهرة يدوياً فوراً."
+            )
+        return
     if not context_ok:
         await event.respond(
             "🔒 لم أستخدم هذه الرسالة. أرسل الرمز في المحادثة الخاصة الأصلية مع البوت."
@@ -390,20 +491,22 @@ async def _submit_x_challenge_code(event, st, raw):
         )
         return
 
-    key = _x_challenge_key(event)
-    future = _x_challenges.get(key)
+    future = original_future
     if not deleted:
         if future is not None and not future.done():
             future.cancel()
-        _x_challenges.pop(key, None)
-        _clear_state(uid)
+        if _x_challenges.get(key) is future:
+            _x_challenges.pop(key, None)
+        if state.get(uid) is st:
+            _clear_state(uid)
         await event.respond(
             "❌ لم أستطع حذف رسالة الرمز بأمان، فألغيت محاولة دخول X. "
             "احذف الرسالة يدوياً ثم ابدأ مجدداً."
         )
         return
     if future is None or future.done():
-        _clear_state(uid)
+        if state.get(uid) is st:
+            _clear_state(uid)
         await event.respond("⌛ انتهت محاولة تسجيل X. ابدأها من لوحة التحكم مجدداً.")
         return
 
@@ -1179,7 +1282,8 @@ async def _handle_reply_button(event, action, st=None, *, already_deleted=False)
     uid = event.sender_id
     current = st or state.get(uid)
     sensitive = (current or {}).get("action") in {
-        "x_email", "x_pass", "x_auth_code", "claim_code",
+        "x_email", "x_pass_pending", "x_pass",
+        "x_login_running", "x_auth_code", "claim_code",
     }
     should_delete = sensitive or _has_secret_tombstone(event)
 
@@ -1228,6 +1332,8 @@ async def on_menu(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if await _reject_callback_during_x_setup(event):
+        return
     what = event.data.decode().split(":", 1)[1]
 
     if what == "login":
@@ -1236,6 +1342,8 @@ async def on_menu(event):
                 f"الحساب مسجّل حالياً: {S.get('user_phone')}\n"
                 "لإعادة تسجيل الدخول أرسل الرقم مرة أخرى."
             )
+            if await _reject_callback_during_x_setup(event):
+                return
         _set_state(event.sender_id, {"action": "login_phone"})
         await event.respond(
             "🔐 أرسل رقم هاتف الحساب الشخصي:\n"
@@ -1289,11 +1397,17 @@ async def on_src(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if await _reject_callback_during_x_setup(event):
+        return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
         if not await user.is_user_authorized():
+            if await _reject_callback_during_x_setup(event):
+                return
             await event.respond("سجّل دخول الحساب أولاً من 🔐.")
         else:
+            if await _reject_callback_during_x_setup(event):
+                return
             _set_state(event.sender_id, {"action": "add_source"})
             await event.respond("أرسل @يوزر_القناة أو رابطها أو معرّفها الرقمي:")
     elif action == "del":
@@ -1348,6 +1462,8 @@ async def on_xlogin(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if await _reject_callback_during_x_setup(event):
+        return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
         if not _is_private_chat(event):
@@ -1356,12 +1472,22 @@ async def on_xlogin(event):
                 alert=True,
             )
             return
+        existing = _x_login_tasks.get(event.sender_id)
+        if existing is not None and not existing.done():
+            await event.answer(
+                "لديك محاولة دخول X جارية. ألغها أولاً بالزر الظاهر في المحادثة.",
+                alert=True,
+            )
+            return
+        setup_id = _new_x_setup_id()
         _set_state(event.sender_id, {
             "action": "x_user",
             "x_chat_id": event.chat_id,
+            "x_setup_id": setup_id,
         })
         await event.respond(
-            "🐦 استخدم حساب X ثانوياً.\nأرسل **اسم المستخدم** (بدون @):"
+            "🐦 استخدم حساب X ثانوياً.\nأرسل **اسم المستخدم** (بدون @):",
+            buttons=_x_setup_buttons(setup_id),
         )
     elif action == "switch":
         _set_state(event.sender_id, {"action": "x_switch"})
@@ -1378,6 +1504,62 @@ async def on_xlogin(event):
             "داخل Telegram عند الحاجة."
         )
     await event.answer()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^xsetup:"))
+async def on_xsetup(event):
+    """أزرار خطوات إعداد X الظاهرة مباشرة تحت رسائل الإدخال."""
+    uid = event.sender_id
+    st = _get_state(uid)
+    if not S.is_admin(uid):
+        if st and st.get("action") in X_SETUP_ACTIONS:
+            _cancel_x_login(uid)
+        await event.answer("غير مصرّح لك.", alert=True)
+        return
+    if not st or st.get("action") not in X_SETUP_ACTIONS:
+        await event.answer("انتهت هذه الخطوة.", alert=True)
+        return
+    if not _x_private_context_matches(event, st):
+        await event.answer("استخدم الزر في المحادثة الخاصة الأصلية.", alert=True)
+        return
+
+    try:
+        prefix, setup_id, action = event.data.decode().split(":", 2)
+    except (AttributeError, UnicodeDecodeError, ValueError):
+        await event.answer("زر غير صالح.", alert=True)
+        return
+    current_id = st.get("x_setup_id")
+    if (
+        prefix != "xsetup"
+        or not current_id
+        or not secrets.compare_digest(str(current_id), setup_id)
+    ):
+        await event.answer("هذا الزر من محاولة قديمة.", alert=True)
+        return
+    if action == "skip_email":
+        if st.get("action") != "x_email":
+            await event.answer("زر التخطي لم يعد صالحاً لهذه الخطوة.", alert=True)
+            return
+        # حالة انتقالية قبل أول await: أي رسالة بريد متزامنة تُرفض ولا يمكن أن
+        # تُفسّر ككلمة مرور. كما تبقى هوية المحاولة قابلة للفحص بعد Telegram RPC.
+        pending = _set_x_password_pending(uid, st, None)
+        await event.answer("تم تخطي البريد")
+        if state.get(uid) is not pending:
+            return
+        if not S.is_admin(uid):
+            _cancel_x_login(uid)
+            return
+        await _prompt_x_password(event, pending)
+        return
+    if action == "cancel":
+        task = _cancel_x_login(uid)
+        await event.answer("أُلغيت العملية")
+        await event.respond(
+            "🛑 أُلغيت محاولة تسجيل X." if task is not None
+            else "🛑 أُلغيت عملية إضافة حساب X."
+        )
+        return
+    await event.answer("زر غير معروف.", alert=True)
 
 
 # ============ حسابات X المتابَعة ============
@@ -1402,6 +1584,8 @@ async def _show_x_accounts(event):
 async def on_xacc(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
+        return
+    if await _reject_callback_during_x_setup(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
@@ -1458,6 +1642,8 @@ async def on_flt(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if await _reject_callback_during_x_setup(event):
+        return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
         _set_state(event.sender_id, {"action": "add_filter"})
@@ -1486,6 +1672,8 @@ async def _show_admins(event):
 async def on_adm(event):
     if event.sender_id != S.get("owner_id"):
         await event.answer("للمالك فقط.", alert=True)
+        return
+    if await _reject_callback_during_x_setup(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
@@ -1648,6 +1836,8 @@ def _publish_block_message(item_id, item=None):
 async def on_post_action(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
+        return
+    if await _reject_callback_during_x_setup(event):
         return
     action, _, item_id = event.data.decode().partition(":")
     item = PENDING.get(item_id)
@@ -1950,7 +2140,10 @@ async def on_text(event):
     # ⚠️ أمان: الصلاحية تُفحص عند فتح المحادثة فقط، فمن أُزيل من الأدمنين بعدها
     # كان بإمكانه إكمال خطوة معلّقة (تغيير توكن فيسبوك مثلاً). نعيد الفحص هنا.
     if not S.is_admin(uid):
-        if st.get("action") in {"x_email", "x_pass", "x_auth_code"}:
+        if st.get("action") in {
+            "x_email", "x_pass_pending", "x_pass",
+            "x_login_running", "x_auth_code",
+        }:
             deleted = await _delete_secret_message(event)
             if not deleted:
                 await event.respond("⚠️ احذف رسالة اعتماد X الظاهرة يدوياً فوراً.")
@@ -1959,11 +2152,14 @@ async def on_text(event):
         return
     # كل خطوات اعتماد X تبدأ وتكتمل في المحادثة الخاصة نفسها. لو أرسل الأدمن
     # كلمة المرور/الرمز في مجموعة بالخطأ نحاول حذفها ولا نسلّمها لمحاولة الدخول.
-    if action in {"x_user", "x_email", "x_pass", "x_auth_code"} and not (
+    if action in X_SETUP_ACTIONS and not (
         _x_private_context_matches(event, st)
     ):
         deleted = True
-        if action in {"x_email", "x_pass", "x_auth_code"}:
+        if action in {
+            "x_email", "x_pass_pending", "x_pass",
+            "x_login_running", "x_auth_code",
+        }:
             deleted = await _delete_secret_message(event)
         await event.respond(
             "🔒 أكمل إعداد X في المحادثة الخاصة التي بدأت منها العملية."
@@ -2007,16 +2203,26 @@ async def on_text(event):
             "action": "x_email",
             "x_username": text.lstrip("@"),
             "x_chat_id": st.get("x_chat_id", event.chat_id),
+            "x_setup_id": st.get("x_setup_id") or _new_x_setup_id(),
         })
-        await event.respond("أرسل بريد الحساب الإلكتروني (أو أرسل `-` لتخطّيه):")
+        email_state = state[uid]
+        await event.respond(
+            "أرسل بريد الحساب الإلكتروني، أو اضغط زر التخطي:",
+            buttons=_x_setup_buttons(
+                email_state["x_setup_id"], allow_email_skip=True,
+            ),
+        )
     elif action == "x_email":
-        _set_state(uid, {
-            "action": "x_pass",
-            "x_username": st.get("x_username"),
-            "x_email": None if text == "-" else text,
-            "x_chat_id": st.get("x_chat_id", event.chat_id),
-        })
-        await event.respond("أرسل **كلمة مرور** حساب X:")
+        pending = _set_x_password_pending(uid, st, None if text == "-" else text)
+        await _prompt_x_password(event, pending)
+    elif action in {"x_pass_pending", "x_login_running"}:
+        # قد تصل رسالة البريد بالتزامن مع زر التخطي، أو يرسل المستخدم سراً قبل
+        # اكتمال طلبه. نتعامل معها كسِر محتمل ولا نمررها مطلقاً إلى X.
+        deleted = await _delete_secret_message(event)
+        await event.respond(
+            "⏳ انتظر ظهور خطوة الإدخال التالية، ثم أرسل القيمة المطلوبة مجدداً."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
     elif action == "x_pass":
         # كلمات المرور حساسة لحروف المسافة؛ لا نمرر النسخة المقتطعة أعلاه.
         await _save_x_login(event, st, event.text)
@@ -2114,6 +2320,7 @@ async def _save_fb_token(event, token):
 async def _save_x_login(event, st, password):
     username = st.get("x_username")
     email = st.get("x_email")
+    setup_id = st.get("x_setup_id") or _new_x_setup_id()
     uid = event.sender_id
     if not _x_private_context_matches(event, st):
         deleted = await _delete_secret_message(event)
@@ -2155,12 +2362,19 @@ async def _save_x_login(event, st, password):
     _x_login_tasks[uid] = task
     _x_login_cancelled.discard(uid)
     _x_login_deleting.add(uid)
+    _set_state(uid, {
+        "action": "x_login_running",
+        "x_chat_id": st.get("x_chat_id", event.chat_id),
+        "x_setup_id": setup_id,
+    })
     credentials = {"username": username, "email": email, "password": password}
     password = None
 
     async def challenge_handler(kind, prompt=""):
         _require_x_admin(uid)
-        response = await _wait_for_x_challenge(event, kind, prompt)
+        response = await _wait_for_x_challenge(
+            event, kind, prompt, setup_id=setup_id,
+        )
         _require_x_admin(uid)
         return response
 
@@ -2169,7 +2383,6 @@ async def _save_x_login(event, st, password):
             deleted = await _delete_secret_message(event)
         finally:
             _x_login_deleting.discard(uid)
-        _clear_state(uid)
         # /cancel أثناء await الحذف لا يقطع عملية الحذف نفسها؛ يمنع الاتصال بـX
         # فور اكتمالها، ثم ينظف finally القفل ونسخة كلمة المرور.
         if uid in _x_login_cancelled:
@@ -2239,7 +2452,7 @@ async def _save_x_login(event, st, password):
         if challenge is not None and not challenge.done():
             challenge.cancel()
         current = state.get(uid)
-        if current and current.get("action") == "x_auth_code":
+        if current and current.get("x_setup_id") == setup_id:
             _clear_state(uid)
 
 
