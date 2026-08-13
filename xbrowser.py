@@ -29,10 +29,16 @@ USERNAME_SELECTOR = (
 PASSWORD_SELECTOR = (
     'input[name="password"]:visible, input[autocomplete="current-password"]:visible'
 )
-# Deliberately do not fall back to ``input[name=text]``.  X uses that generic
-# name for several different steps (including the username page), so typing a
-# one-time secret into it without a reviewed subtask marker is unsafe.
-GENERIC_INPUT_SELECTOR = 'input[data-testid="ocfEnterTextTextInput"]:visible'
+# The OCF selector covers the older flow. JF renders either its dedicated
+# one-time-code field or a typed input whose username/password variants are
+# explicitly excluded. Body classification and actionability checks must still
+# identify a reviewed challenge before anything is filled.
+GENERIC_INPUT_SELECTOR = (
+    'input[data-testid="ocfEnterTextTextInput"]:visible, '
+    'input.jf-code-input-field[autocomplete="one-time-code"]:visible, '
+    'input.jf-input:not([autocomplete~="username"]):not([type="password"]):visible, '
+    'input.jf-float-input:not([autocomplete~="username"]):not([type="password"]):visible'
+)
 NEXT_SELECTOR = '[data-testid="ocfEnterTextNextButton"]:visible'
 LOGIN_SELECTOR = (
     '[data-testid="LoginForm_Login_Button"]:visible, '
@@ -50,6 +56,10 @@ class XBrowserError(RuntimeError):
 
 class XBrowserUnavailable(XBrowserError):
     """Chromium or its Playwright driver is unavailable."""
+
+
+class XBrowserRateLimited(XBrowserError):
+    """X temporarily limited interactive login attempts."""
 
 
 class XBrowserPageChanged(XBrowserError):
@@ -169,6 +179,74 @@ async def _is_visible(locator):
         return False
 
 
+async def _is_actionable(locator):
+    """Reject geometrically visible decoys that cannot receive user input.
+
+    X keeps future-step inputs in the DOM with a non-zero bounding box while
+    setting ``opacity: 0`` and ``pointer-events: none``.  Playwright therefore
+    considers them visible even though a user cannot interact with them.
+    """
+    try:
+        eligible = bool(await locator.evaluate("""node => {
+            const rect = node.getBoundingClientRect();
+            if (!node.isConnected || rect.width <= 0 || rect.height <= 0
+                    || node.matches(':disabled') || node.readOnly
+                    || node.getAttribute('aria-disabled') === 'true') return false;
+            const codeProxy = node.matches(
+                'input.jf-code-input-field[autocomplete="one-time-code"]'
+            );
+            for (let current = node; current; current = current.parentElement) {
+                const style = window.getComputedStyle(current);
+                const opacity = Number.parseFloat(style.opacity || '1');
+                if (style.display === 'none' || style.visibility === 'hidden'
+                        || (current === node && style.pointerEvents === 'none')
+                        || (Number.isFinite(opacity) && opacity <= 0
+                            && !(codeProxy && current === node))) {
+                    return false;
+                }
+            }
+            return true;
+        }"""))
+        if not eligible:
+            return False
+        # Trial mode performs Playwright's hit-target/actionability checks but
+        # never dispatches the click.  It distinguishes the active responsive
+        # form from the covered duplicate currently rendered by X.
+        await locator.click(trial=True, timeout=1_000)
+        return True
+    except Exception:  # noqa: BLE001 - ambiguous DOM must fail closed
+        return False
+
+
+async def _actionable_candidates(locator, *, limit=10):
+    try:
+        count = await locator.count()
+    except Exception:  # noqa: BLE001
+        return []
+    if count > limit:
+        raise XBrowserPageChanged("X login controls are ambiguous")
+    candidates = []
+    for index in range(min(count, limit)):
+        candidate = locator.nth(index)
+        if await _is_actionable(candidate):
+            candidates.append(candidate)
+    return candidates
+
+
+async def _single_actionable(locator, message):
+    candidates = await _actionable_candidates(locator)
+    if len(candidates) != 1:
+        raise XBrowserPageChanged(message)
+    return candidates[0]
+
+
+async def _unique_actionable(locator, message):
+    candidates = await _actionable_candidates(locator)
+    if len(candidates) > 1:
+        raise XBrowserPageChanged(message)
+    return candidates[0] if candidates else None
+
+
 async def _body_text(page):
     try:
         return (await page.locator("body").inner_text(timeout=2_000)).lower()
@@ -177,14 +255,21 @@ async def _body_text(page):
 
 
 def _classify_text(text):
+    text = str(text or "").lower()
     if any(term in text for term in (
         "captcha", "arkose", "security key", "passkey", "scan the qr",
         "approve this login", "check your other device",
     )):
         return "unsupported"
     if any(term in text for term in (
+        "temporarily limited your login", "too many login attempts",
+        "try again later",
+    )):
+        return "rate_limited"
+    if any(term in text for term in (
         "wrong password", "incorrect password", "could not find your account",
-        "we cannot find your account", "account doesn’t exist", "account doesn't exist",
+        "we cannot find your account", "couldn't find an active x account",
+        "account doesn’t exist", "account doesn't exist",
     )):
         return "credentials"
     if any(term in text for term in (
@@ -270,6 +355,8 @@ async def _wait_for_stage(
         classification = _classify_text(text)
         if classification == "unsupported":
             raise XBrowserUnsupportedChallenge("X requested an unsupported challenge")
+        if classification == "rate_limited":
+            raise XBrowserRateLimited("X temporarily limited login attempts")
         if classification == "credentials":
             raise XBrowserCredentialsRejected("X rejected the account credentials")
         if transition is not None:
@@ -278,9 +365,15 @@ async def _wait_for_stage(
                 continue
             transition = None
         if allow_password:
-            if await _is_visible(page.locator(PASSWORD_SELECTOR)):
+            if await _unique_actionable(
+                page.locator(PASSWORD_SELECTOR),
+                "X password field is ambiguous",
+            ) is not None:
                 return "password", None
-        if await _is_visible(page.locator(GENERIC_INPUT_SELECTOR)):
+        if await _unique_actionable(
+            page.locator(GENERIC_INPUT_SELECTOR),
+            "X verification field is ambiguous",
+        ) is not None:
             if classification in {
                 "alternate_identifier", "verification", "two_factor",
             }:
@@ -304,18 +397,58 @@ async def _capture_transition(page, field, selector):
         "body": body,
         "classification": _classify_text(body),
         "selector": selector,
+        "password_actionable": (
+            await _unique_actionable(
+                page.locator(PASSWORD_SELECTOR),
+                "X password field is ambiguous",
+            ) is not None
+        ),
     }
 
 
 async def _transition_completed(page, marker, current_text):
     """Prove X acknowledged a submission before interpreting the next DOM."""
+    current_classification = _classify_text(current_text)
+    reviewed_challenge = current_classification in {
+        "alternate_identifier", "verification", "two_factor",
+    }
+    challenge_field = None
+    if reviewed_challenge:
+        challenge_field = await _unique_actionable(
+            page.locator(GENERIC_INPUT_SELECTOR),
+            "X verification field is ambiguous",
+        )
+    if (
+        marker["selector"] == USERNAME_SELECTOR
+        and not marker.get("password_actionable")
+        and await _unique_actionable(
+            page.locator(PASSWORD_SELECTOR),
+            "X password field is ambiguous",
+        ) is not None
+    ):
+        # The JF page keeps its password node mounted as an opacity-zero decoy
+        # during the username step, then enables that same node after X accepts
+        # the account identifier.
+        return True
+    if marker["selector"] in {USERNAME_SELECTOR, PASSWORD_SELECTOR}:
+        if challenge_field is not None:
+            return True
+    if (
+        marker["selector"] == GENERIC_INPUT_SELECTOR
+        and challenge_field is not None
+        and current_classification != marker["classification"]
+    ):
+        return True
     old = marker["handle"]
     node_changed = False
     try:
         if not await old.evaluate("node => node.isConnected"):
             node_changed = True
-        current = page.locator(marker["selector"]).first
-        if not node_changed and await current.count() == 0:
+        current = await _unique_actionable(
+            page.locator(marker["selector"]),
+            "X login field is ambiguous",
+        )
+        if not node_changed and current is None:
             # A loading overlay may temporarily hide the same still-attached
             # input. Hidden is not proof that X accepted the submitted secret.
             return False
@@ -330,25 +463,33 @@ async def _transition_completed(page, marker, current_text):
         raise XBrowserPageChanged(
             "X login field transition could not be verified"
         ) from None
-    current_classification = _classify_text(current_text)
     # A same-node credentials error is an explicit server acknowledgement and
     # terminates the attempt; it never causes another secret to be filled.
     if current_text != marker["body"] and current_classification == "credentials":
         return True
     if node_changed:
         if marker["selector"] == USERNAME_SELECTOR:
-            return await _is_visible(page.locator(PASSWORD_SELECTOR)) or (
+            return await _unique_actionable(
+                page.locator(PASSWORD_SELECTOR),
+                "X password field is ambiguous",
+            ) is not None or (
                 current_classification in {
                     "alternate_identifier", "verification", "two_factor",
                 }
-                and await _is_visible(page.locator(GENERIC_INPUT_SELECTOR))
+                and await _unique_actionable(
+                    page.locator(GENERIC_INPUT_SELECTOR),
+                    "X verification field is ambiguous",
+                ) is not None
             )
         if marker["selector"] == PASSWORD_SELECTOR:
             return (
                 current_classification in {
                     "alternate_identifier", "verification", "two_factor",
                 }
-                and await _is_visible(page.locator(GENERIC_INPUT_SELECTOR))
+                and await _unique_actionable(
+                    page.locator(GENERIC_INPUT_SELECTOR),
+                    "X verification field is ambiguous",
+                ) is not None
             )
         if marker["selector"] == GENERIC_INPUT_SELECTOR:
             if current_classification != marker["classification"]:
@@ -361,7 +502,12 @@ async def _transition_completed(page, marker, current_text):
         try:
             # X may reuse the same input for a rejected OTP.  Only treat that
             # as a new attempt once X itself has cleared the submitted value.
-            current = page.locator(marker["selector"]).first
+            current = await _unique_actionable(
+                page.locator(marker["selector"]),
+                "X login field is ambiguous",
+            )
+            if current is None:
+                return False
             return not (await current.input_value()).strip()
         except Exception:
             raise XBrowserPageChanged(
@@ -372,15 +518,27 @@ async def _transition_completed(page, marker, current_text):
 
 async def _fill_and_next(page, selector, value, *, login=False):
     _require_allowed_page(page)
-    field = page.locator(selector).first
-    await field.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    field = await _single_actionable(
+        page.locator(selector), "X login input is not actionable",
+    )
     transition = await _capture_transition(page, field, selector)
     _require_allowed_page(page)
     await field.fill(value, timeout=STEP_TIMEOUT_MS)
     _require_allowed_page(page)
-    button_selector = LOGIN_SELECTOR if login else NEXT_SELECTOR
-    button = page.locator(button_selector).first
-    await button.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    button = None
+    form = field.locator("xpath=ancestor::form[1]")
+    if await form.count() == 1:
+        scoped = await _actionable_candidates(form.locator(LOGIN_SELECTOR))
+        if len(scoped) > 1:
+            raise XBrowserPageChanged("X login submit control is ambiguous")
+        if scoped:
+            button = scoped[0]
+    if button is None:
+        button_selector = LOGIN_SELECTOR if login else NEXT_SELECTOR
+        button = await _single_actionable(
+            page.locator(button_selector),
+            "X login submit control is unavailable",
+        )
     _require_allowed_page(page)
     await button.click(timeout=STEP_TIMEOUT_MS)
     return transition
@@ -403,31 +561,38 @@ async def _click(page, selector):
 
 
 async def _fill_and_submit_static_form(page, username, password):
-    """Fill one reviewed full form and submit via its password field.
+    """Fill and submit one reviewed full login form.
 
-    The current X form has no native submit control and its visible buttons are
-    alternate login methods.  Pressing Enter on the password field avoids
-    guessing a localized/anonymous button.  Both secrets are resolved inside
-    the *same* owning form because X currently renders two responsive forms.
+    X creates its ``Continue`` submit control only after both fields contain a
+    value.  Resolve that control inside the *same* owning form as the two
+    fields; the page also contains responsive duplicate forms and unrelated
+    phone/Apple buttons, so a page-global click would be ambiguous.
     """
     _require_allowed_page(page)
-    password_field = page.locator(PASSWORD_SELECTOR).first
-    await password_field.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    password_field = await _single_actionable(
+        page.locator(PASSWORD_SELECTOR),
+        "X full login password field is not actionable",
+    )
     transition = await _capture_transition(page, password_field, PASSWORD_SELECTOR)
     form = password_field.locator("xpath=ancestor::form[1]")
     await form.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
-    username_field = form.locator(USERNAME_SELECTOR).first
-    password_field = form.locator(PASSWORD_SELECTOR).first
-    if await username_field.count() != 1 or await password_field.count() != 1:
-        raise XBrowserPageChanged("X full login form is ambiguous")
-    await username_field.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
-    await password_field.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    username_field = await _single_actionable(
+        form.locator(USERNAME_SELECTOR), "X full login form is ambiguous",
+    )
+    password_field = await _single_actionable(
+        form.locator(PASSWORD_SELECTOR), "X full login form is ambiguous",
+    )
     _require_allowed_page(page)
     await username_field.fill(username, timeout=STEP_TIMEOUT_MS)
     _require_allowed_page(page)
     await password_field.fill(password, timeout=STEP_TIMEOUT_MS)
     _require_allowed_page(page)
-    await password_field.press("Enter", timeout=STEP_TIMEOUT_MS)
+    submit = await _single_actionable(
+        form.locator(LOGIN_SELECTOR),
+        "X full login submit control is ambiguous",
+    )
+    _require_allowed_page(page)
+    await submit.click(timeout=STEP_TIMEOUT_MS)
     return transition
 
 
@@ -577,7 +742,10 @@ async def _obtain_cookies(
         # and a responsive full form with username and password visible together.
         # Detect the latter before clicking anything; never guess a button when
         # the password field is not actually present.
-        static_form = await _is_visible(page.locator(PASSWORD_SELECTOR))
+        static_form = await _unique_actionable(
+            page.locator(PASSWORD_SELECTOR),
+            "X password field is ambiguous",
+        ) is not None
         if static_form:
             transition = await _fill_and_submit_static_form(page, username, password)
             username = None
