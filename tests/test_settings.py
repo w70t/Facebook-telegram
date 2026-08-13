@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -472,3 +473,97 @@ def test_x_last_id_never_moves_backwards(settings):
     assert settings.x_accounts()[0]["last_id"] == "105"
     settings.set_x_last_id("source", 106)
     assert settings.x_accounts()[0]["last_id"] == "106"
+
+
+def test_x_login_cooldown_is_durable_and_contains_no_credentials(settings):
+    until = time.time() + 3600
+    record = settings.start_x_login_cooldown(
+        until, 42, generation="cooldown-a",
+    )
+    assert record == {
+        "generation": "cooldown-a",
+        "started_at": float(until - 3600),
+        "until": float(until),
+        "duration_seconds": 3600,
+        "chat_id": 42,
+        "message_id": None,
+        "notified": False,
+    }
+    assert settings.set_x_login_cooldown_message("cooldown-a", 987) is True
+
+    reloaded = Settings(path=settings.path)
+    assert reloaded.x_login_cooldown()["message_id"] == 987
+    serialized = Path(settings.path).read_text(encoding="utf-8")
+    assert "username" not in serialized
+    assert "password" not in serialized
+
+
+def test_x_login_cooldown_compare_and_set_rejects_stale_scheduler(settings):
+    until = time.time() + 3600
+    settings.start_x_login_cooldown(until, 42, generation="old")
+    settings.start_x_login_cooldown(until + 100, 84, generation="new")
+
+    assert settings.set_x_login_cooldown_message("old", 10) is False
+    assert settings.mark_x_login_cooldown_notified("old") is False
+    current = settings.x_login_cooldown()
+    assert current["generation"] == "new"
+    assert current["message_id"] is None
+    assert current["notified"] is False
+
+
+def test_x_login_cooldown_failed_transaction_keeps_previous_value(
+    settings, monkeypatch,
+):
+    until = time.time() + 3600
+    settings.start_x_login_cooldown(until, 42, generation="safe")
+    before = settings.x_login_cooldown()
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(settings_module, "atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="disk unavailable"):
+        settings.start_x_login_cooldown(
+            until + 100, 84, generation="not-committed",
+        )
+    assert settings.x_login_cooldown() == before
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("generation", ""),
+    ("generation", "x" * 129),
+    ("started_at", -1),
+    ("started_at", float("nan")),
+    ("until", -1),
+    ("until", float("inf")),
+    ("duration_seconds", 0),
+    ("duration_seconds", 24 * 60 * 60 + 1),
+    ("chat_id", "42"),
+    ("message_id", -1),
+])
+def test_malformed_x_login_cooldown_is_ignored(settings, field, value):
+    bad = {
+        "generation": "x",
+        "started_at": 1_000.0,
+        "until": 4_600.0,
+        "duration_seconds": 3_600,
+        "chat_id": 42,
+        "message_id": None,
+        "notified": False,
+    }
+    bad[field] = value
+    settings.set("x_login_cooldown", bad)
+    assert settings.x_login_cooldown() is None
+
+
+def test_inconsistent_x_login_cooldown_duration_is_ignored(settings):
+    settings.set("x_login_cooldown", {
+        "generation": "x",
+        "started_at": 1_000.0,
+        "until": 9_999.0,
+        "duration_seconds": 3_600,
+        "chat_id": 42,
+        "message_id": None,
+        "notified": False,
+    })
+    assert settings.x_login_cooldown() is None
