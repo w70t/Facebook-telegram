@@ -1,6 +1,7 @@
 """اختبارات regressions لمسارات النشر والاستعادة الحساسة في main.py."""
 import asyncio
 import os
+import re
 import sys
 import types
 
@@ -685,6 +686,48 @@ def test_x_password_is_not_trimmed_and_may_start_with_slash(app, monkeypatch):
     assert event.deleted is True
 
 
+@pytest.mark.parametrize("command", [
+    "/panel", "/start", "/id", "/claim old-code", "/panel@my_bot",
+])
+def test_known_slash_command_is_never_submitted_as_x_password(
+    app, monkeypatch, command,
+):
+    async def must_not_submit(*_args, **_kwargs):
+        raise AssertionError("أمر البوت وصل ككلمة مرور X")
+
+    monkeypatch.setattr(app, "_save_x_login", must_not_submit)
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    asyncio.run(app.on_text(Event(text=command)))
+    # generic handler لا يستهلك الأمر ولا tombstone؛ المعالج الخاص يتولى
+    # التنقل ويرفع StopPropagation في dispatch الحقيقي.
+    assert app._get_state(42)["action"] == "x_pass"
+
+
+@pytest.mark.parametrize("handler", [
+    "on_panel_command", "on_id_command", "on_cancel_command",
+])
+def test_legacy_command_handler_stops_generic_dispatch(app, handler):
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+
+    async def scenario():
+        with pytest.raises(app.events.StopPropagation):
+            await getattr(app, handler)(Event(text="/panel"))
+
+    asyncio.run(scenario())
+    assert app._get_state(42) is None
+    assert (42, 42) in app._x_secret_tombstones
+
+
 def test_first_telegram_response_failure_releases_x_login_lock(app, monkeypatch):
     called = []
 
@@ -1211,3 +1254,430 @@ def test_revoked_admin_challenge_is_cancelled_without_saving(app, monkeypatch):
     assert app._x_login_tasks == {}
     assert app._x_challenges == {}
     assert app._get_state(84) is None
+
+
+def _button_labels(markup):
+    return [button.text for row in markup for button in row]
+
+
+def test_command_reply_keyboard_is_persistent_arabic_and_not_inline(app):
+    markup = app._command_keyboard()
+    assert _button_labels(markup) == [
+        app.BTN_PANEL, app.BTN_ID, app.BTN_CANCEL,
+    ]
+    for row in markup:
+        for button in row:
+            assert button.data is None
+            assert button.resize is True
+            assert button.persistent is True
+            assert button.placeholder == "اختر أمراً"
+
+    claim_markup = app._command_keyboard(claim=True)
+    assert _button_labels(claim_markup) == [
+        app.BTN_CLAIM, app.BTN_ID, app.BTN_CANCEL,
+    ]
+
+
+def test_start_sends_reply_keyboard_separately_from_inline_panel(app):
+    event = Event(text="/start")
+    asyncio.run(app.cmd_panel(event))
+
+    assert len(event.response_buttons) == 2
+    reply_markup, inline_markup = event.response_buttons
+    assert all(button.data is None for row in reply_markup for button in row)
+    assert all(button.data is not None for row in inline_markup for button in row)
+
+
+@pytest.mark.parametrize("label, expected", [
+    ("BTN_PANEL", "لوحة التحكم"),
+    ("BTN_ID", "معرّفك"),
+    ("BTN_CANCEL", "لا توجد عملية معلّقة"),
+])
+def test_arabic_reply_buttons_route_as_normal_messages(app, label, expected):
+    event = Event(text=getattr(app, label))
+    asyncio.run(app.on_text(event))
+    assert any(expected in response for response in event.responses)
+
+
+def test_reply_keyboard_is_not_installed_in_a_group(app):
+    event = Event(text="/panel", chat_id=-100123, is_private=False)
+    asyncio.run(app.cmd_panel(event))
+    assert len(event.response_buttons) == 1
+    assert all(
+        button.data is not None
+        for row in event.response_buttons[0]
+        for button in row
+    )
+
+
+def test_stale_keyboard_is_cleared_for_unauthorized_user(app):
+    event = Event(text=app.BTN_PANEL, sender_id=84)
+    asyncio.run(app.on_text(event))
+    assert "لست ضمن الأدمنين" in event.responses[-1]
+    assert event.response_buttons[-1].clear is True
+
+
+def test_panel_button_during_x_password_cancels_without_submitting(
+    app, monkeypatch,
+):
+    async def must_not_submit(*_args, **_kwargs):
+        raise AssertionError("عنوان Reply Keyboard وصل ككلمة مرور X")
+
+    monkeypatch.setattr(app, "_save_x_login", must_not_submit)
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    event = Event(text=app.BTN_PANEL)
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is True
+    assert app._get_state(42) is None
+    assert (42, 42) in app._x_secret_tombstones
+    assert any("لوحة التحكم" in response for response in event.responses)
+
+
+def test_cancel_button_during_x_password_uses_secure_cancel_path(app):
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    event = Event(text=app.BTN_CANCEL)
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is True
+    assert app._get_state(42) is None
+    assert app._x_login_tasks == {}
+    assert app._x_challenges == {}
+    assert (42, 42) in app._x_secret_tombstones
+    assert any("أُلغيت عملية الإعداد" in response for response in event.responses)
+
+
+def test_reply_button_preserves_x_tombstone_and_still_routes(app):
+    app._x_secret_tombstones[(42, 42)] = (
+        app.time.monotonic() + app.X_SECRET_TOMBSTONE_TTL
+    )
+    event = Event(text=app.BTN_PANEL)
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is True
+    assert (42, 42) in app._x_secret_tombstones
+    assert any("لوحة التحكم" in response for response in event.responses)
+
+    late_secret = Event(text="actual-late-password")
+    asyncio.run(app.on_text(late_secret))
+    assert late_secret.deleted is True
+    assert (42, 42) not in app._x_secret_tombstones
+    assert any("أُهملت هذه الرسالة" in response for response in late_secret.responses)
+
+
+def test_expired_x_password_reply_button_is_deleted_and_still_routes(app):
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    app.state[42]["ts"] = app.time.time() - app.STATE_TTL - 1
+    event = Event(text=app.BTN_PANEL)
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is True
+    assert app._get_state(42) is None
+    assert (42, 42) in app._x_secret_tombstones
+    assert any("لوحة التحكم" in response for response in event.responses)
+
+    late_secret = Event(text="actual-late-password")
+    asyncio.run(app.on_text(late_secret))
+    assert late_secret.deleted is True
+    assert any("أُهملت هذه الرسالة" in response for response in late_secret.responses)
+
+
+def test_near_match_is_not_a_reply_command(app):
+    app._set_state(42, {"action": "add_filter"})
+    text = app.BTN_PANEL + " الآن"
+    event = Event(text=text)
+    asyncio.run(app.on_text(event))
+    assert text in app.S.filter_words()
+    assert not any(response == "⚙️ لوحة التحكم:" for response in event.responses)
+
+
+def test_claim_button_accepts_code_without_typing_slash_command(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "safe-claim-code"
+    app._claim_attempts = 0
+
+    start = Event(text=app.BTN_CLAIM)
+    asyncio.run(app.on_text(start))
+    assert app._get_state(42)["action"] == "claim_code"
+
+    code = Event(text="safe-claim-code")
+    asyncio.run(app.on_text(code))
+    assert code.deleted is True
+    assert app.S.get("owner_id") == 42
+    assert app.S.is_admin(42)
+    assert app._get_state(42) is None
+    assert _button_labels(code.response_buttons[0]) == [
+        app.BTN_PANEL, app.BTN_ID, app.BTN_CANCEL,
+    ]
+    assert all(
+        button.data is not None
+        for row in code.response_buttons[1]
+        for button in row
+    )
+
+
+def test_expired_claim_code_is_deleted_and_never_claims_owner(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "late-claim-code"
+    app._set_state(42, {"action": "claim_code", "claim_chat_id": 42})
+    app.state[42]["ts"] = app.time.time() - app.STATE_TTL - 1
+
+    event = Event(text="late-claim-code")
+    asyncio.run(app.on_text(event))
+    assert event.deleted is True
+    assert app.S.get("owner_id") is None
+    assert app._get_state(42) is None
+    assert any("أُهملت هذه الرسالة" in response for response in event.responses)
+
+
+def test_command_keyboard_is_offered_only_once_per_version(app, monkeypatch):
+    sent = []
+
+    async def send_message(chat, text, buttons=None):
+        sent.append((chat, text, buttons))
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    async def scenario():
+        assert await app._offer_command_keyboard(42) is True
+        assert await app._offer_command_keyboard(42) is False
+
+    asyncio.run(scenario())
+    assert len(sent) == 1
+    assert app.S.get("reply_keyboard_versions") == {
+        "42": app.REPLY_KEYBOARD_VERSION,
+    }
+
+
+@pytest.mark.parametrize("handler_name, valid, invalid", [
+    ("on_panel_command", "/panel", "/panelXYZ"),
+    ("on_panel_command", "/start@my_bot", "/starter"),
+    ("on_id_command", "/id", "/identify"),
+    ("on_cancel_command", "/cancel@my_bot", "/cancelXYZ"),
+    ("on_claim_command", "/claim secret", "/claimXYZ"),
+])
+def test_legacy_command_patterns_have_strict_boundaries(
+    app, handler_name, valid, invalid,
+):
+    event_builder = next(
+        builder
+        for builder, handler in app.bot.handlers
+        if handler is getattr(app, handler_name)
+    )
+    pattern = event_builder.kwargs["pattern"]
+    assert re.match(pattern, valid)
+    assert not re.match(pattern, invalid)
+
+
+def test_legacy_claim_code_in_group_is_deleted_and_never_used(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "private-only-code"
+    event = Event(
+        text="/claim private-only-code", chat_id=-100123, is_private=False,
+    )
+    event.pattern_match = re.match(
+        r"^/claim(?:@\w+)?(?:\s+(\S+))?$", event.text
+    )
+    asyncio.run(app.cmd_claim(event))
+    assert event.deleted is True
+    assert app.S.get("owner_id") is None
+    assert app._claim_attempts == 0
+    assert any("محادثة" in response for response in event.responses)
+
+
+@pytest.mark.parametrize("text", [
+    "/claim private-only-code ",
+    "/claim private-only-code extra",
+    "/claim\tprivate-only-code\textra",
+])
+def test_malformed_legacy_claim_is_always_deleted_without_attempt(app, text):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "private-only-code"
+    event = Event(text=text, chat_id=-100123, is_private=False)
+    asyncio.run(app.cmd_claim(event))
+    assert event.deleted is True
+    assert app.S.get("owner_id") is None
+    assert app._claim_attempts == 0
+
+
+def test_claim_code_from_wrong_chat_is_deleted_without_counting_attempt(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "private-only-code"
+    app._set_state(42, {"action": "claim_code", "claim_chat_id": 42})
+    event = Event(
+        text="private-only-code", chat_id=-100123, is_private=False,
+    )
+    asyncio.run(app.on_text(event))
+    assert event.deleted is True
+    assert app.S.get("owner_id") is None
+    assert app._claim_attempts == 0
+    assert app._get_state(42)["action"] == "claim_code"
+
+
+@pytest.mark.parametrize("label", ["BTN_PANEL", "BTN_ID", "BTN_CANCEL"])
+def test_group_reply_button_cannot_cancel_private_x_state(app, label):
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    event = Event(
+        text=getattr(app, label), chat_id=-100123, is_private=False,
+    )
+    asyncio.run(app.on_text(event))
+    assert event.deleted is True
+    assert app._get_state(42)["action"] == "x_pass"
+    assert (42, 42) not in app._x_secret_tombstones
+    assert any("الخاصة" in response for response in event.responses)
+
+
+def test_claim_navigation_cancels_synchronously_and_deletes_late_code(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "late-claim-code"
+    app._set_state(42, {"action": "claim_code", "claim_chat_id": 42})
+    delete_started = None
+    release_delete = None
+    panel = Event(text=app.BTN_PANEL)
+
+    async def blocked_delete():
+        delete_started.set()
+        await release_delete.wait()
+        panel.deleted = True
+
+    panel.delete = blocked_delete
+
+    async def scenario():
+        nonlocal delete_started, release_delete
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        task = asyncio.create_task(app.on_text(panel))
+        await delete_started.wait()
+        # الإلغاء ثُبّت قبل اكتمال Telegram RPC.
+        assert app._get_state(42) is None
+        assert (42, 42) in app._x_secret_tombstones
+        late = Event(text="late-claim-code")
+        await app.on_text(late)
+        assert late.deleted is True
+        assert app.S.get("owner_id") is None
+        release_delete.set()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_cancel_while_claim_code_delete_is_in_flight_prevents_ownership(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "in-flight-code"
+    app._set_state(42, {"action": "claim_code", "claim_chat_id": 42})
+    delete_started = None
+    release_delete = None
+    code = Event(text="in-flight-code")
+
+    async def blocked_delete():
+        delete_started.set()
+        await release_delete.wait()
+        code.deleted = True
+
+    code.delete = blocked_delete
+
+    async def scenario():
+        nonlocal delete_started, release_delete
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        code_task = asyncio.create_task(app.on_text(code))
+        await delete_started.wait()
+        await app.on_text(Event(text=app.BTN_PANEL))
+        assert app._get_state(42) is None
+        release_delete.set()
+        await code_task
+
+    asyncio.run(scenario())
+    assert code.deleted is True
+    assert app.S.get("owner_id") is None
+
+
+def test_cancel_while_legacy_claim_delete_is_in_flight_prevents_ownership(app):
+    app.S.set_many({"owner_id": None, "admin_ids": []})
+    app._claim_code = "legacy-in-flight"
+    delete_started = None
+    release_delete = None
+    command = Event(text="/claim legacy-in-flight")
+    command.pattern_match = re.match(
+        r"^/claim(?:@\w+)?(?:\s+(\S+))?$", command.text
+    )
+
+    async def blocked_delete():
+        delete_started.set()
+        await release_delete.wait()
+        command.deleted = True
+
+    command.delete = blocked_delete
+
+    async def scenario():
+        nonlocal delete_started, release_delete
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        claim_task = asyncio.create_task(app.cmd_claim(command))
+        await delete_started.wait()
+        assert app._get_state(42)["action"] == "claim_code"
+        await app.on_text(Event(text=app.BTN_CANCEL))
+        release_delete.set()
+        await claim_task
+
+    asyncio.run(scenario())
+    assert command.deleted is True
+    assert app.S.get("owner_id") is None
+
+
+def test_cancel_command_does_not_consume_its_own_tombstone(app):
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_email": None,
+        "x_chat_id": 42,
+    })
+    command = Event(text="/cancel")
+
+    async def scenario():
+        with pytest.raises(app.events.StopPropagation):
+            await app.on_cancel_command(command)
+        # حتى لو استُدعي generic يدوياً، الأمر المحجوز لا يستهلك الحارس.
+        await app.on_text(command)
+
+    asyncio.run(scenario())
+    assert (42, 42) in app._x_secret_tombstones
+    late = Event(text="actual-late-password")
+    asyncio.run(app.on_text(late))
+    assert late.deleted is True
+
+
+def test_new_setup_does_not_clear_late_secret_tombstone(app):
+    app._x_secret_tombstones[(42, 42)] = (
+        app.time.monotonic() + app.X_SECRET_TOMBSTONE_TTL
+    )
+    app._set_state(42, {"action": "add_filter"})
+    late = Event(text="actual-late-password")
+    asyncio.run(app.on_text(late))
+    assert late.deleted is True
+    assert "actual-late-password" not in app.S.filter_words()
+    assert app._get_state(42)["action"] == "add_filter"
+
+    intended = Event(text="intended-filter")
+    asyncio.run(app.on_text(intended))
+    assert "intended-filter" in app.S.filter_words()

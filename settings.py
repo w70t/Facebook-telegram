@@ -26,6 +26,8 @@ DEFAULTS = {
     # يُضبط من داخل تلغرام
     "owner_id": None,
     "admin_ids": [],
+    # إصدار لوحة أوامر Telegram التي أُرسلت لكل أدمن؛ يمنع تكرار الرسالة عند كل restart.
+    "reply_keyboard_versions": {},
     "review_chat_id": None,
     "fb_page_id": None,
     "fb_page_token": None,

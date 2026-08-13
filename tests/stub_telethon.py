@@ -10,13 +10,36 @@ import types
 
 
 class Button:
-    def __init__(self, text, data):
+    def __init__(
+        self, text, data, *, resize=None, single_use=None, selective=None,
+        persistent=None, placeholder=None,
+    ):
         self.text = text
         self.data = data
+        self.resize = resize
+        self.single_use = single_use
+        self.selective = selective
+        self.persistent = persistent
+        self.placeholder = placeholder
 
     @staticmethod
     def inline(text, data=None):
         return Button(text, data)
+
+    @staticmethod
+    def text(
+        text, *, resize=None, single_use=None, selective=None,
+        persistent=None, placeholder=None,
+    ):
+        return Button(
+            text, None, resize=resize, single_use=single_use,
+            selective=selective, persistent=persistent,
+            placeholder=placeholder,
+        )
+
+    @staticmethod
+    def clear(selective=None):
+        return types.SimpleNamespace(clear=True, selective=selective)
 
 
 class _Event:
