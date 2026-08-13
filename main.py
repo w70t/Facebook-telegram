@@ -70,13 +70,12 @@ log = logging.getLogger("tg2fb")
 S = Settings()
 
 try:
-    _scrubbed_x_passwords = S.scrub_x_login_passwords()
-    if _scrubbed_x_passwords:
-        log.info("حُذفت %d كلمة مرور X قديمة من الإعدادات", _scrubbed_x_passwords)
+    _scrubbed_x_settings = S.scrub_x_integration_data()
+    if _scrubbed_x_settings:
+        log.info("حُذفت إعدادات X القديمة (%d مفتاحاً)", _scrubbed_x_settings)
 except OSError as exc:
-    # لا تُستخدم كلمة المرور القديمة في الخلفية أو مسار المتصفح، لكن نعيد محاولة
-    # حذفها في التشغيل التالي إذا كان القرص مؤقتاً للقراءة فقط/ممتلئاً.
-    log.error("تعذّر حذف كلمات مرور X القديمة من القرص (%s)", type(exc).__name__)
+    # X يظل معطلاً حتى إن تعذر تنظيف القرص، ونعيد محاولة الحذف في التشغيل التالي.
+    log.error("تعذّر حذف إعدادات X القديمة من القرص (%s)", type(exc).__name__)
 
 if not S.bootstrap_ready():
     print("❌ لم يتم الإعداد الأولي بعد. شغّل أولاً:  python configure.py")
@@ -160,6 +159,10 @@ _publishing: set[str] = set()
 _published: set[str] = set()
 STATE_TTL = 600                    # محادثة إعداد مهجورة تنتهي بعد 10 دقائق
 HOUSEKEEPING_SECONDS = 3600
+# X متوقف بالكامل بقرار المنتج. نبقي الكود القديم معزولاً مؤقتاً حتى يمكن
+# تنظيف البيانات المحلية لاحقاً، لكن لا نعرضه ولا نبدأ أي اتصال أو مهمة له.
+X_INTEGRATION_ENABLED = False
+X_DISABLED_MESSAGE = "⛔ خدمة X متوقفة بالكامل في هذا البوت."
 X_CHALLENGE_TIMEOUT = 180          # رمز X مؤقت؛ لا نحتفظ به أكثر من 3 دقائق
 X_SECRET_DELETE_TIMEOUT = 15       # لا نحتفظ بكلمة المرور بسبب RPC معلّق بلا حد
 X_SECRET_TOMBSTONE_TTL = STATE_TTL # يغطي مهلة كل محادثة إعداد/رمز متأخر
@@ -988,6 +991,9 @@ _X_ORIGIN_RE = re.compile(
 
 def _checkpoint_x_origin(item):
     """يثبّت مؤشر X المضمّن في origin قبل كشف العنصر في Telegram."""
+    if not X_INTEGRATION_ENABLED:
+        # نسمح بعرض منشور قديم محفوظ للمراجعة، لكن لا نعيد إنشاء أي إعداد X.
+        return
     match = _X_ORIGIN_RE.fullmatch(str(item.get("origin") or ""))
     if not match:
         return
@@ -1292,11 +1298,6 @@ def _panel_markup():
         [Button.inline(f"📘 إعداد فيسبوك {fb}", b"m:fb")],
         [Button.inline(f"📍 تعيين قروب المراجعة {rev}", b"m:review")],
         [Button.inline("📡 قنوات تلغرام المصدر", b"m:sources")],
-        [Button.inline(
-            f"🐦 حسابات دخول X ({len(S.x_logins())}) "
-            f"{'✅' if S.x_login_ready() else '❌'}", b"m:xlogins"
-        )],
-        [Button.inline("🐦 حسابات X المتابَعة", b"m:xaccounts")],
         [Button.inline(f"🚫 فلترة الكلمات ({len(S.filter_words())})", b"m:filter")],
         [Button.inline("👤 الأدمنون", b"m:admins")],
         [Button.inline("🌍 رمز الدولة الافتراضي", b"m:cc")],
@@ -1598,9 +1599,13 @@ async def on_menu(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    what = event.data.decode().split(":", 1)[1]
+    if not X_INTEGRATION_ENABLED and what in {"xlogins", "xaccounts"}:
+        _cancel_x_login(event.sender_id)
+        await event.answer(X_DISABLED_MESSAGE, alert=True)
+        return
     if await _reject_callback_during_x_setup(event):
         return
-    what = event.data.decode().split(":", 1)[1]
 
     if what == "login":
         if S.get("user_phone"):
@@ -1786,6 +1791,8 @@ def _x_cooldown_task_done(task):
 def _ensure_x_cooldown_scheduler(record=None):
     """ينشئ مهمة واحدة فقط للجيل الحالي؛ الجيل الجديد يلغي القديمة."""
     global _x_cooldown_task
+    if not X_INTEGRATION_ENABLED:
+        return None
     record = record or _x_cooldown_record()
     if not record or record.get("notified"):
         return None
@@ -2124,6 +2131,8 @@ def _x_account_cooldown_task_done(scope, task):
 
 
 def _ensure_x_account_cooldown_scheduler(scope, record=None):
+    if not X_INTEGRATION_ENABLED:
+        return None
     record = record or _x_account_cooldown_record(scope)
     if not record or record.get("notified"):
         return None
@@ -2393,6 +2402,10 @@ async def on_xlogin(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if not X_INTEGRATION_ENABLED:
+        _cancel_x_login(event.sender_id)
+        await event.answer(X_DISABLED_MESSAGE, alert=True)
+        return
     if _restarting:
         await event.answer("البوت قيد التحديث؛ حاول إضافة حساب X بعد عودته.", alert=True)
         return
@@ -2449,6 +2462,10 @@ async def on_xsetup(event):
         if st and st.get("action") in X_SETUP_ACTIONS:
             _cancel_x_login(uid)
         await event.answer("غير مصرّح لك.", alert=True)
+        return
+    if not X_INTEGRATION_ENABLED:
+        _cancel_x_login(uid)
+        await event.answer(X_DISABLED_MESSAGE, alert=True)
         return
     if not st or st.get("action") not in X_SETUP_ACTIONS:
         await event.answer("انتهت هذه الخطوة.", alert=True)
@@ -2522,6 +2539,10 @@ async def on_xacc(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if not X_INTEGRATION_ENABLED:
+        _cancel_x_login(event.sender_id)
+        await event.answer(X_DISABLED_MESSAGE, alert=True)
+        return
     if await _reject_callback_during_x_setup(event):
         return
     action = event.data.decode().split(":", 1)[1]
@@ -2564,7 +2585,7 @@ async def _show_filter(event):
     text = "🚫 كلمات الفلترة (أي منشور يحتويها يُتجاهل):\n" + (
         "\n".join(f"• {w}" for w in words) if words else "(لا توجد كلمات)"
     )
-    text += "\n\nتُطبّق على منشورات تلغرام و X معاً."
+    text += "\n\nتُطبّق على منشورات تلغرام."
     await event.respond(
         text,
         buttons=[
@@ -2745,9 +2766,7 @@ async def _show_status(event):
         f"• فيسبوك: {'✅' if S.facebook_ready() else '❌'} (Graph {S.get('fb_api_version')})\n"
         f"• قروب المراجعة: {'✅' if S.get('review_chat_id') else '❌'}\n"
         f"• قنوات تلغرام: {len(S.sources())}\n"
-        f"• حسابات دخول X: {len(S.x_logins())} (النشط: "
-        f"{('@' + xreader.active) if xreader.active else '—'})\n"
-        f"• حسابات X المتابَعة: {len(S.x_accounts())}\n"
+        "• X: ⛔ متوقف بالكامل\n"
         f"• منشورات بانتظار المراجعة: {len(PENDING.items)}\n"
         f"• عدد الأدمنين: {len(S.get('admin_ids') or [])}\n"
         f"• رمز الدولة الافتراضي: {S.get('default_cc') or '—'}"
@@ -3067,6 +3086,21 @@ async def on_text(event):
     # المتأخرة بدلاً من انتظار رسالة ثانية.
     if not st:
         await _delete_late_x_secret(event)
+        return
+    if (
+        not X_INTEGRATION_ENABLED
+        and str(st.get("action") or "").startswith("x_")
+    ):
+        # قد تبقى خطوة X في الذاكرة أثناء نشر النسخة الجديدة. لا نمرر أي نص
+        # وصل بعدها إلى قارئ X، ونحذف الرسائل التي ربما تحتوي سراً.
+        deleted = await _delete_secret_message(event)
+        # الرسالة الحالية وصلت وحاولنا حذفها بالفعل؛ لا نترك tombstone يحذف
+        # الرسالة العادية التالية للمستخدم.
+        _cancel_x_login(uid, remember_secret=False)
+        await event.respond(
+            X_DISABLED_MESSAGE
+            + ("" if deleted else "\n⚠️ تعذّر حذف رسالتك؛ احذفها يدوياً فوراً.")
+        )
         return
     # كلمة مرور X قد تبدأ بشرطة مائلة، لكن أسماء أوامر البوت تبقى محجوزة كيلا
     # يعمل handler الأمر ثم تُرسل الرسالة نفسها إلى X ككلمة مرور أيضاً.
@@ -3908,6 +3942,8 @@ _x_alerted = False
 
 async def x_poller():
     global _x_alerted
+    if not X_INTEGRATION_ENABLED:
+        return
     await asyncio.sleep(5)
     while True:
         try:
@@ -3978,11 +4014,7 @@ async def housekeeping():
 async def main():
     global _claim_code, _restarting
     await bot.start(bot_token=S.get("bot_token"))
-    # يعيد تشغيل العداد المحفوظ بعد restart، أو يرسل إشعار الانتهاء فوراً إذا
-    # انقضى الموعد والبوت كان متوقفاً.
-    _ensure_x_cooldown_scheduler()
-    for scope, record in S.x_login_cooldowns().items():
-        _ensure_x_account_cooldown_scheduler(scope, record)
+    # X متوقف: لا نعيد تشغيل عدادات أو جلسات أو أي مهمة خلفية تخصه.
 
     # بعد ترقية نسخة قديمة، تصل لوحة الأزرار للأدمنين تلقائياً مرة واحدة؛
     # لا يحتاج المستخدم إلى كتابة /start أو /panel كي تظهر له.
@@ -4025,7 +4057,6 @@ async def main():
         await asyncio.gather(
             user.run_until_disconnected(),
             bot.run_until_disconnected(),
-            x_poller(),
             housekeeping(),
             _offer_command_keyboards(keyboard_recipients),
         )
