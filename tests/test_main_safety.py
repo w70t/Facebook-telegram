@@ -82,6 +82,16 @@ def app(tmp_path):
             main._x_cooldown_lock = None
             main._x_cooldown_lock_loop = None
             main._x_cooldown_runtime = None
+            for task in list(main._x_account_cooldown_tasks.values()):
+                if task is not None and not task.done():
+                    task.cancel()
+            main._x_account_cooldown_tasks.clear()
+            main._x_account_cooldown_memory.clear()
+            main._x_account_cooldown_runtime.clear()
+            main._x_account_cooldown_notifying.clear()
+            main._x_account_cooldown_notified_memory.clear()
+            main._x_cooldown_hmac_key = None
+            main._x_cooldown_key_error = False
             main._x_browser_cleanup_unconfirmed = False
             main._x_secret_delete_unconfirmed = False
             main._restarting = False
@@ -197,18 +207,194 @@ def test_x_rate_limit_starts_durable_one_hour_countdown(app, monkeypatch):
     assert not any(key in saved for key in ("username", "email", "password"))
 
 
-def test_x_add_is_blocked_with_exact_remaining_countdown(app, monkeypatch):
+def test_legacy_global_countdown_does_not_block_adding_another_account(app, monkeypatch):
     monkeypatch.setattr(app.time, "time", lambda: 1_000.0)
     app.S.start_x_login_cooldown(4_600, 42, generation="waiting")
     event = Event(data=b"xlog:add")
 
     asyncio.run(app.on_xlogin(event))
 
+    assert app._get_state(42)["action"] == "x_user"
+    assert event.answers == [(None, False)]
+    assert any("اسم المستخدم" in response for response in event.responses)
+
+
+def test_x_cooldown_fingerprint_is_stable_canonical_and_not_plaintext(app):
+    first = app._x_cooldown_scope(" @Reader ")
+    second = app._x_cooldown_scope("reader")
+    other = app._x_cooldown_scope("other_reader")
+
+    assert first == second
+    assert first != other
+    assert re.fullmatch(r"[0-9a-f]{64}", first)
+    assert "reader" not in first
+    assert os.path.isfile(app.X_COOLDOWN_KEY_FILE)
+    app._x_cooldown_hmac_key = None
+    assert app._x_cooldown_scope("READER") == first
+    if os.name == "posix":
+        assert os.stat(app.X_COOLDOWN_KEY_FILE).st_mode & 0o777 == 0o600
+
+
+def test_missing_hmac_key_with_existing_scoped_record_fails_closed(app):
+    scope = app._x_cooldown_scope("reader")
+    app.S.start_x_login_cooldown_for(
+        scope, app.time.time() + 3600, 42, generation="must-stay-bound",
+    )
+    os.unlink(app.X_COOLDOWN_KEY_FILE)
+    app._x_cooldown_hmac_key = None
+    app._x_cooldown_key_error = False
+
+    assert app._x_cooldown_scope("reader") is None
+    assert app._x_cooldown_key_error is True
+
+
+@pytest.mark.parametrize("payload", ("[]", '"not-an-object"'))
+def test_malformed_hmac_key_document_fails_closed(app, payload):
+    with open(app.X_COOLDOWN_KEY_FILE, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    app._x_cooldown_hmac_key = None
+    app._x_cooldown_key_error = False
+
+    assert app._x_cooldown_scope("reader") is None
+    assert app._x_cooldown_key_error is True
+
+
+def test_hmac_key_permission_hardening_failure_is_fail_closed(app, monkeypatch):
+    app._x_cooldown_hmac_key = None
+    app._x_cooldown_key_error = False
+
+    def fail_chmod(*_args, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(app.os, "chmod", fail_chmod)
+    assert app._x_cooldown_scope("reader") is None
+    assert app._x_cooldown_key_error is True
+
+
+def test_full_scoped_map_keeps_new_rate_limit_in_fail_closed_memory(app, monkeypatch):
+    until = app.time.time() + 3600
+    scope = app._x_cooldown_scope("reader")
+    for number in range(32):
+        app.S.start_x_login_cooldown_for(
+            f"{number:064x}", until, 42, generation=f"full-{number}",
+        )
+    event = Event()
+
+    async def scenario():
+        record = await app._activate_x_account_cooldown(event, scope)
+        task = app._x_account_cooldown_tasks.get(scope)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return record
+
+    record = asyncio.run(scenario())
+    assert app.S.x_login_cooldown_for(scope) is None
+    assert app._x_account_cooldown_memory[scope]["generation"] == record["generation"]
+    assert app._x_account_cooldown_remaining(scope, record) > 0
+    assert any("هذا الحساب فقط" in reply for reply in event.responses)
+    assert app.S.get("x_login_cooldown_emergency") is True
+    assert app.Settings(path=app.S.path).x_login_cooldown()["generation"] == record["generation"]
+
+
+def test_valid_but_wrong_hmac_key_is_rejected_when_key_id_exists(app):
+    assert app._x_cooldown_scope("reader") is not None
+    with open(app.X_COOLDOWN_KEY_FILE, "w", encoding="utf-8") as handle:
+        import json
+        json.dump({"version": 1, "key": (b"x" * 32).hex()}, handle)
+    app._x_cooldown_hmac_key = None
+    app._x_cooldown_key_error = False
+
+    assert app._x_cooldown_scope("reader") is None
+    assert app._x_cooldown_key_error is True
+
+
+def test_two_account_cooldown_schedulers_coexist(app):
+    scope_a = app._x_cooldown_scope("reader_a")
+    scope_b = app._x_cooldown_scope("reader_b")
+    record_a = app.S.start_x_login_cooldown_for(
+        scope_a, app.time.time() + 3600, 42, generation="a",
+    )
+    record_b = app.S.start_x_login_cooldown_for(
+        scope_b, app.time.time() + 3600, 42, generation="b",
+    )
+
+    async def scenario():
+        task_a = app._ensure_x_account_cooldown_scheduler(scope_a, record_a)
+        task_b = app._ensure_x_account_cooldown_scheduler(scope_b, record_b)
+        assert task_a is not task_b
+        assert set(app._x_account_cooldown_tasks) == {scope_a, scope_b}
+        await app._shutdown_x_account_cooldowns()
+
+    asyncio.run(scenario())
+    assert app._x_account_cooldown_tasks == {}
+
+
+def test_scoped_cooldown_blocks_only_matching_username_after_entry(app):
+    blocked_scope = app._x_cooldown_scope("blocked_reader")
+    app.S.start_x_login_cooldown_for(
+        blocked_scope, app.time.time() + 3600, 42, generation="blocked",
+    )
+
+    async def scenario():
+        add = Event(data=b"xlog:add")
+        await app.on_xlogin(add)
+        assert app._get_state(42)["action"] == "x_user"
+        allowed = Event(text="other_reader")
+        await app.on_text(allowed)
+        allowed_state = app._get_state(42)
+        assert allowed_state["action"] == "x_email"
+        assert allowed_state["x_cooldown_scope"] != blocked_scope
+
+        app._cancel_x_login(42)
+        await app.on_text(Event(text="late-secret"))
+        await app.on_xlogin(Event(data=b"xlog:add"))
+        denied = Event(text="@BLOCKED_READER")
+        await app.on_text(denied)
+        return denied
+
+    denied = asyncio.run(scenario())
     assert app._get_state(42) is None
-    assert event.answers == [
-        ("⏳ ما زال عداد X يعمل. المتبقي: 01:00:00. "
-         "سأرسل زر المحاولة عند انتهائه.", True)
-    ]
+    assert any("هذا الحساب وحده" in response for response in denied.responses)
+    assert not any("البريد" in response for response in denied.responses)
+
+
+def test_other_account_cooldown_starting_during_delete_does_not_block_browser(
+    app, monkeypatch,
+):
+    other_scope = app._x_cooldown_scope("other_reader")
+    login_calls = []
+
+    async def delete_and_block_other(event):
+        event.deleted = True
+        app.S.start_x_login_cooldown_for(
+            other_scope, app.time.time() + 3600, 42, generation="other",
+        )
+        return True
+
+    async def login_interactive(credentials, _challenge_handler):
+        login_calls.append(credentials["username"])
+        return False
+
+    monkeypatch.setattr(app, "_delete_secret_message", delete_and_block_other)
+    monkeypatch.setattr(app.xreader, "login_interactive", login_interactive)
+    event = Event(text="must-disappear")
+
+    asyncio.run(app._save_x_login(
+        event,
+        {
+            "x_username": "reader",
+            "x_cooldown_scope": app._x_cooldown_scope("reader"),
+            "x_email": None,
+            "x_chat_id": 42,
+            "x_setup_id": "different-account-race",
+        },
+        event.text,
+    ))
+
+    assert event.deleted is True
+    assert login_calls == ["reader"]
+    assert app.S.x_login_cooldown_for(other_scope)["generation"] == "other"
 
 
 def test_x_countdown_rebases_after_raspberry_clock_rolls_back(app, monkeypatch):
@@ -254,6 +440,53 @@ def test_restart_creates_missing_countdown_message_once(app, monkeypatch):
     assert sends[0][0] == 42
     assert "01:00:00" in sends[0][1]
     assert app.S.x_login_cooldown()["message_id"] == 777
+
+
+def test_active_legacy_countdown_stays_enforced_after_admin_revocation(
+    app, monkeypatch,
+):
+    app.S.add_admin(84)
+    app.S.start_x_login_cooldown(
+        app.time.time() + 3600, 84, generation="future-revoked",
+    )
+    app.S.remove_admin(84)
+    sends = []
+
+    async def send_message(*args, **kwargs):
+        sends.append((args, kwargs))
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    assert asyncio.run(app._create_x_cooldown_message("future-revoked")) is False
+    record = app.S.x_login_cooldown()
+    assert sends == []
+    assert record["notified"] is False
+    assert app._x_cooldown_remaining(record) > 0
+
+
+def test_active_scoped_countdown_stays_enforced_after_admin_revocation(
+    app, monkeypatch,
+):
+    app.S.add_admin(84)
+    scope = app._x_cooldown_scope("reader")
+    app.S.start_x_login_cooldown_for(
+        scope, app.time.time() + 3600, 84, generation="future-scoped-revoked",
+    )
+    app.S.remove_admin(84)
+    sends = []
+
+    async def send_message(*args, **kwargs):
+        sends.append((args, kwargs))
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    assert asyncio.run(app._create_x_account_cooldown_message(
+        scope, "future-scoped-revoked",
+    )) is False
+    record = app.S.x_login_cooldown_for(scope)
+    assert sends == []
+    assert record["notified"] is False
+    assert app._x_account_cooldown_remaining(scope, record) > 0
 
 
 def test_new_countdown_survives_ntp_jump_during_first_telegram_rpc(
@@ -400,11 +633,12 @@ def test_cooldown_starting_during_secret_delete_stops_before_browser(
     app, monkeypatch,
 ):
     login_calls = []
+    scope = app._x_cooldown_scope("reader")
 
     async def delete_and_start_cooldown(event):
         event.deleted = True
-        app.S.start_x_login_cooldown(
-            app.time.time() + 3600, 42, generation="race",
+        app.S.start_x_login_cooldown_for(
+            scope, app.time.time() + 3600, 42, generation="race",
         )
         return True
 
@@ -440,11 +674,11 @@ def test_rate_limit_clears_credentials_before_countdown_rpc(app, monkeypatch):
         credential_refs.append(credentials)
         raise app.XBrowserRateLimited("internal detail")
 
-    async def assert_cleared_before_await(_event):
-        activation_checks.append(dict(credential_refs[0]))
+    async def assert_cleared_before_await(_event, scope):
+        activation_checks.append((dict(credential_refs[0]), scope))
 
     monkeypatch.setattr(app.xreader, "login_interactive", rate_limited)
-    monkeypatch.setattr(app, "_activate_x_login_cooldown", assert_cleared_before_await)
+    monkeypatch.setattr(app, "_activate_x_account_cooldown", assert_cleared_before_await)
     event = Event(text="must-disappear")
 
     asyncio.run(app._save_x_login(
@@ -453,7 +687,7 @@ def test_rate_limit_clears_credentials_before_countdown_rpc(app, monkeypatch):
         event.text,
     ))
 
-    assert activation_checks == [{}]
+    assert activation_checks == [({}, app._x_cooldown_scope("reader"))]
     assert credential_refs[0] == {}
     assert app.S.x_logins() == []
 
@@ -1067,7 +1301,7 @@ def test_stale_x_email_skip_button_cannot_change_password_step(app):
 def test_old_x_setup_button_cannot_change_new_flow(app, action):
     async def scenario():
         await app.on_xlogin(Event(data=b"xlog:add"))
-        first_username = Event(text="first-reader")
+        first_username = Event(text="first_reader")
         await app.on_text(first_username)
         old_id = app._get_state(42)["x_setup_id"]
 
@@ -1077,7 +1311,7 @@ def test_old_x_setup_button_cannot_change_new_flow(app, action):
         # بدء المحاولة الجديدة.
         await app.on_text(Event(text="late-old-secret"))
         await app.on_xlogin(Event(data=b"xlog:add"))
-        second_username = Event(text="second-reader")
+        second_username = Event(text="second_reader")
         await app.on_text(second_username)
         new_state = app._get_state(42)
         assert new_state["x_setup_id"] != old_id
@@ -1089,7 +1323,7 @@ def test_old_x_setup_button_cannot_change_new_flow(app, action):
     new_state, stale = asyncio.run(scenario())
     assert app._get_state(42) is new_state
     assert new_state["action"] == "x_email"
-    assert new_state["x_username"] == "second-reader"
+    assert new_state["x_username"] == "second_reader"
     assert any(alert for _text, alert in stale.answers)
 
 
@@ -1857,7 +2091,8 @@ def test_x_login_failure_is_sanitized_and_does_not_persist(app, monkeypatch):
     assert all("secret server detail" not in reply for reply in password_event.responses)
 
 
-def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch):
+def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch, caplog):
+    caplog.set_level(20, logger="tg2fb")
     async def fake_login(_credentials, _challenge_handler):
         raise app.XBrowserRateLimited("fixed internal detail")
 
@@ -1874,6 +2109,16 @@ def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch)
     assert password_event.deleted is True
     assert any("مؤقتاً" in reply and "انتظر" in reply for reply in password_event.responses)
     assert all("fixed internal detail" not in reply for reply in password_event.responses)
+    scope = app._x_cooldown_scope("reader")
+    assert set(app.S.x_login_cooldowns()) == {scope}
+    assert app.S.x_login_cooldown() is None
+    with open(app.S.path, encoding="utf-8") as handle:
+        serialized = handle.read()
+    assert "reader" not in serialized
+    assert "do-not-save" not in serialized
+    assert "XLOGIN_STAGE rate_limited" in caplog.text
+    assert "do-not-save" not in caplog.text
+    assert "fixed internal detail" not in caplog.text
 
 
 def test_second_admin_cannot_overlap_x_login_attempt(app):

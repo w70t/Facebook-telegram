@@ -2,6 +2,7 @@
 .env
 settings.json
 settings.json.bak
+x_cooldown_key.json
 pending.json
 pending.json.bak
 *.corrupt-*
