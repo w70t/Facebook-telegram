@@ -7,6 +7,7 @@ password, or one-time verification value to disk.
 """
 
 import asyncio
+import inspect
 import os
 import time
 from urllib.parse import urlparse
@@ -21,6 +22,15 @@ MAX_CHALLENGE_ATTEMPTS = 3
 MAX_COOKIES = 80
 MAX_COOKIE_NAME = 128
 MAX_COOKIE_VALUE = 8192
+
+# Only these fixed, secret-free browser milestones may leave this module.
+# Never pass a URL, page text, selector, username, password, or challenge value
+# through the progress callback.
+SAFE_PROGRESS_STAGES = {
+    "page_ready",
+    "username_submitted",
+    "password_submitted",
+}
 
 USERNAME_SELECTOR = (
     'input[name="username_or_email"]:visible, '
@@ -60,6 +70,18 @@ class XBrowserUnavailable(XBrowserError):
 
 class XBrowserRateLimited(XBrowserError):
     """X temporarily limited interactive login attempts."""
+
+
+class XBrowserTransientError(XBrowserError):
+    """X displayed a temporary retry message that is not proof of a limit."""
+
+    SAFE_REASONS = {
+        "retry_later",
+    }
+
+    def __init__(self, message="X temporarily could not complete login", *, reason="retry_later"):
+        super().__init__(message)
+        self.reason = reason if reason in self.SAFE_REASONS else "retry_later"
 
 
 class XBrowserPageChanged(XBrowserError):
@@ -256,25 +278,273 @@ async def _unique_actionable(locator, message):
     return candidates[0] if candidates else None
 
 
-async def _body_text(page):
+_VISIBLE_STAGE_TEXT_JS = r"""entry => {
+    const document = entry && entry.ownerDocument;
+    const body = document && document.body;
+    if (!body) return '';
+
+    // Bind ordinary text to the active login surface.  Error banners rendered
+    // through a portal are admitted only when they declare an alert/live-region
+    // role.  This avoids classifying visible copy from a different responsive
+    // form, sidebar, or footer as the result of the active submission.
+    const anchor = entry === body ? null : entry;
+    const dialog = anchor && anchor.closest(
+        '[role="dialog"], [aria-modal="true"], [data-testid="sheetDialog"]'
+    );
+    const root = dialog
+        || (anchor && anchor.closest('form'))
+        || (anchor && anchor.closest('main'))
+        || body;
+    const roots = [root];
+    if (anchor) {
+        for (const live of body.querySelectorAll(
+                '[role="alert"], [role="status"], '
+                + '[aria-live]:not([aria-live="off"])')) {
+            if (!root.contains(live)) roots.push(live);
+        }
+    }
+
+    const number = String.raw`[-+]?(?:\d+(?:\.\d*)?|\.\d+)`;
+    const parseLength = (token, size) => {
+        const match = String(token || '').trim().match(
+            new RegExp(`^(${number})(px|%)?$`, 'i')
+        );
+        if (!match) return null;
+        const value = Number.parseFloat(match[1]);
+        if (!Number.isFinite(value)) return null;
+        return match[2] === '%' ? value * size / 100 : value;
+    };
+    const fourSides = values => {
+        if (values.length === 1) return [values[0], values[0], values[0], values[0]];
+        if (values.length === 2) return [values[0], values[1], values[0], values[1]];
+        if (values.length === 3) return [values[0], values[1], values[2], values[1]];
+        return values.length === 4 ? values : null;
+    };
+    const zeroAlpha = value => {
+        const normalized = String(value || '').toLowerCase().replace(/\s+/g, '');
+        if (!normalized) return false;
+        if (normalized === 'transparent') return true;
+        const functionMatch = normalized.match(/^([a-z][a-z0-9-]*)\((.*)\)$/i);
+        if (!functionMatch) return false;
+        const functionName = functionMatch[1];
+        const argumentsText = functionMatch[2];
+        let alphaToken = null;
+        const slash = argumentsText.lastIndexOf('/');
+        if (slash >= 0) {
+            alphaToken = argumentsText.slice(slash + 1);
+        } else if (['rgba', 'hsla'].includes(functionName)) {
+            const commaValues = argumentsText.split(',');
+            if (commaValues.length === 4) alphaToken = commaValues[3];
+        }
+        if (alphaToken === null) return false;
+        const match = alphaToken.match(new RegExp(`^(${number})(%)?$`, 'i'));
+        if (!match) return false;
+        const alpha = Number.parseFloat(match[1]) / (match[2] ? 100 : 1);
+        return Number.isFinite(alpha) && alpha <= 0.001;
+    };
+    const intersect = (rect, clip, x = true, y = true) => ({
+        left: x ? Math.max(rect.left, clip.left) : rect.left,
+        right: x ? Math.min(rect.right, clip.right) : rect.right,
+        top: y ? Math.max(rect.top, clip.top) : rect.top,
+        bottom: y ? Math.min(rect.bottom, clip.bottom) : rect.bottom,
+    });
+    const nonEmpty = rect => (
+        rect.right - rect.left > 0.5 && rect.bottom - rect.top > 0.5
+    );
+    const point = (token, size, start) => {
+        const named = {left: 0, top: 0, center: size / 2, right: size, bottom: size};
+        const lowered = String(token || '').trim().toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(named, lowered)) {
+            return start + named[lowered];
+        }
+        const length = parseLength(lowered, size);
+        return length === null ? null : start + length;
+    };
+    const basicClipBounds = (element, style) => {
+        const box = element.getBoundingClientRect();
+        const path = String(style.clipPath || style.webkitClipPath || '').trim();
+        if (path && path !== 'none') {
+            let match = path.match(/^inset\((.*)\)$/i);
+            if (match) {
+                const raw = match[1].split(/\s+round\s+/i)[0].trim().split(/\s+/);
+                const sides = fourSides(raw);
+                if (sides) {
+                    const top = parseLength(sides[0], box.height);
+                    const right = parseLength(sides[1], box.width);
+                    const bottom = parseLength(sides[2], box.height);
+                    const left = parseLength(sides[3], box.width);
+                    if (![top, right, bottom, left].includes(null)) {
+                        return {
+                            left: box.left + left, right: box.right - right,
+                            top: box.top + top, bottom: box.bottom - bottom,
+                        };
+                    }
+                }
+            }
+            match = path.match(/^circle\((.*)\)$/i);
+            if (match) {
+                const parts = match[1].split(/\s+at\s+/i);
+                const radius = parseLength(parts[0].trim(), Math.min(box.width, box.height));
+                const position = (parts[1] || 'center center').trim().split(/\s+/);
+                const cx = point(position[0], box.width, box.left);
+                const cy = point(position[1] || position[0], box.height, box.top);
+                if (![radius, cx, cy].includes(null)) {
+                    return {left: cx - radius, right: cx + radius,
+                            top: cy - radius, bottom: cy + radius};
+                }
+            }
+            match = path.match(/^ellipse\((.*)\)$/i);
+            if (match) {
+                const parts = match[1].split(/\s+at\s+/i);
+                const radii = parts[0].trim().split(/\s+/);
+                const rx = parseLength(radii[0], box.width);
+                const ry = parseLength(radii[1], box.height);
+                const position = (parts[1] || 'center center').trim().split(/\s+/);
+                const cx = point(position[0], box.width, box.left);
+                const cy = point(position[1] || position[0], box.height, box.top);
+                if (![rx, ry, cx, cy].includes(null)) {
+                    return {left: cx - rx, right: cx + rx,
+                            top: cy - ry, bottom: cy + ry};
+                }
+            }
+            match = path.match(/^polygon\((.*)\)$/i);
+            if (match && !match[1].includes('calc(')) {
+                const points = match[1].split(',').map(pair => {
+                    const values = pair.trim().split(/\s+/);
+                    if (values.length !== 2) return null;
+                    const x = point(values[0], box.width, box.left);
+                    const y = point(values[1], box.height, box.top);
+                    return x === null || y === null ? null : {x, y};
+                });
+                if (points.length >= 3 && points.every(Boolean)) {
+                    return {
+                        left: Math.min(...points.map(item => item.x)),
+                        right: Math.max(...points.map(item => item.x)),
+                        top: Math.min(...points.map(item => item.y)),
+                        bottom: Math.max(...points.map(item => item.y)),
+                    };
+                }
+            }
+        }
+        const legacy = String(style.clip || '').trim();
+        const match = legacy.match(/^rect\((.*)\)$/i);
+        if (match) {
+            const values = match[1].trim().split(/[\s,]+/);
+            if (values.length === 4 && !values.includes('auto')) {
+                const top = parseLength(values[0], box.height);
+                const right = parseLength(values[1], box.width);
+                const bottom = parseLength(values[2], box.height);
+                const left = parseLength(values[3], box.width);
+                if (![top, right, bottom, left].includes(null)) {
+                    return {
+                        left: box.left + left, right: box.left + right,
+                        top: box.top + top, bottom: box.top + bottom,
+                    };
+                }
+            }
+        }
+        return null;
+    };
+    const rendered = node => {
+        const parent = node.parentElement;
+        if (!parent) return false;
+        const textStyle = window.getComputedStyle(parent);
+        if (zeroAlpha(textStyle.color)
+                || zeroAlpha(textStyle.webkitTextFillColor)) return false;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        let rectangles = [...range.getClientRects()].map(rect => intersect(rect, {
+            left: 0, top: 0,
+            right: window.innerWidth, bottom: window.innerHeight,
+        })).filter(nonEmpty);
+        if (!rectangles.length) return false;
+
+        let effectiveOpacity = 1;
+        for (let current = parent; current; current = current.parentElement) {
+            const style = window.getComputedStyle(current);
+            const ariaHidden = String(current.getAttribute('aria-hidden') || '')
+                .trim().toLowerCase() === 'true';
+            if (current.hidden || current.inert || current.hasAttribute('inert')
+                    || ariaHidden || style.display === 'none'
+                    || style.visibility === 'hidden'
+                    || style.visibility === 'collapse'
+                    || style.contentVisibility === 'hidden') return false;
+            const opacity = Number.parseFloat(style.opacity || '1');
+            if (Number.isFinite(opacity)) effectiveOpacity *= opacity;
+            for (const match of String(style.filter || '').matchAll(
+                    /opacity\(\s*([\d.]+)%?\s*\)/gi)) {
+                const value = Number.parseFloat(match[1]);
+                if (Number.isFinite(value)) {
+                    effectiveOpacity *= match[0].includes('%') ? value / 100 : value;
+                }
+            }
+            if (effectiveOpacity <= 0.001) return false;
+
+            const clip = basicClipBounds(current, style);
+            if (clip) rectangles = rectangles.map(rect => intersect(rect, clip));
+            const box = current.getBoundingClientRect();
+            const clipsX = ['auto', 'hidden', 'clip', 'scroll']
+                .includes(String(style.overflowX || '').toLowerCase());
+            const clipsY = ['auto', 'hidden', 'clip', 'scroll']
+                .includes(String(style.overflowY || '').toLowerCase());
+            if (clipsX || clipsY) {
+                if ((clipsX && current.clientWidth <= 0)
+                        || (clipsY && current.clientHeight <= 0)) return false;
+                rectangles = rectangles.map(rect => intersect(rect, box, clipsX, clipsY));
+            }
+            rectangles = rectangles.filter(nonEmpty);
+            if (!rectangles.length) return false;
+        }
+        return true;
+    };
+
+    const visible = [];
+    const seen = new Set();
+    for (const searchRoot of roots) {
+        const walker = document.createTreeWalker(searchRoot, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (seen.has(node)) continue;
+            seen.add(node);
+            const value = (node.nodeValue || '').trim();
+            if (value && rendered(node)) visible.push(value);
+        }
+    }
+    return visible.join('\n').slice(0, 20000);
+}"""
+
+
+async def _body_text(page, *, anchor=None):
+    """Return rendered text bound to the active login surface when possible.
+
+    ``innerText`` still admits opacity-zero, clipped, off-screen, and responsive
+    duplicates.  The DOM policy above checks every ancestor and the effective
+    clipping rectangle.  Passing the current actionable input additionally
+    binds ordinary text to its dialog/form; accessible live error portals are
+    the only text admitted from outside that surface.
+    """
     try:
-        return (await page.locator("body").inner_text(timeout=2_000)).lower()
-    except Exception:  # noqa: BLE001
+        entry = anchor if anchor is not None else page.locator("body")
+        text = await entry.evaluate(_VISIBLE_STAGE_TEXT_JS)
+        return str(text or "").lower()
+    except Exception:  # noqa: BLE001 - a remount is an empty observation
         return ""
 
 
 def _classify_text(text):
     text = str(text or "").lower()
+    # Unsupported challenges deliberately require instructional wording.  A
+    # normal login form may visibly offer "Sign in with a passkey" as an
+    # unselected alternative; that must not be mistaken for a forced challenge.
     if any(term in text for term in (
-        "captcha", "arkose", "security key", "passkey", "scan the qr",
+        "captcha", "arkose", "use your security key", "insert your security key",
+        "tap your security key", "security key to continue", "use your passkey",
+        "verify with your passkey", "scan the qr",
         "approve this login", "check your other device",
     )):
         return "unsupported"
-    if any(term in text for term in (
-        "temporarily limited your login", "too many login attempts",
-        "try again later",
-    )):
-        return "rate_limited"
+    # Specific account/challenge evidence precedes any generic or explicit
+    # retry wording.  A page can retain the active prompt while appending an
+    # error banner; choosing the more specific result avoids a false cooldown.
     if any(term in text for term in (
         "wrong password", "incorrect password", "could not find your account",
         "we cannot find your account", "couldn't find an active x account",
@@ -299,6 +569,17 @@ def _classify_text(text):
         "email address or phone", "enter your phone number", "enter your email",
     )):
         return "alternate_identifier"
+    # Only these reviewed phrases prove a login limit.  A bare "try again
+    # later" remains transient and must never start a long cooldown.
+    if any(term in text for term in (
+        "temporarily limited your login", "too many login attempts",
+    )):
+        return "rate_limited"
+    # This phrase is deliberately last.  It accompanies many unrelated X
+    # errors (including credential/challenge rejection), so it is not evidence
+    # of an account/IP rate limit and must never start a long cooldown by itself.
+    if "try again later" in text:
+        return "transient"
     return None
 
 
@@ -338,6 +619,19 @@ async def _request_challenge(challenge_handler, kind, cancel_event):
             response_task.cancel()
 
 
+async def _report_progress(progress_handler, stage):
+    """Report one allowlisted milestone without exposing browser contents."""
+    if progress_handler is None:
+        return
+    if not callable(progress_handler):
+        raise TypeError("progress_handler must be callable")
+    if stage not in SAFE_PROGRESS_STAGES:
+        raise XBrowserPageChanged("X browser progress stage is invalid")
+    result = progress_handler(stage)
+    if inspect.isawaitable(result):
+        await result
+
+
 def _require_allowed_page(page):
     if getattr(page, "_tg2fb_untrusted_redirect", False) or not _top_level_allowed(page.url):
         raise XBrowserUnsupportedChallenge("X redirected login outside its reviewed hosts")
@@ -360,12 +654,33 @@ async def _wait_for_stage(
         names = {item.get("name") for item in cookies if isinstance(item, dict)}
         if {"auth_token", "ct0"}.issubset(names):
             return "success", cookies
-        text = await _body_text(page)
+        password_field = None
+        if allow_password:
+            password_field = await _unique_actionable(
+                page.locator(PASSWORD_SELECTOR),
+                "X password field is ambiguous",
+            )
+        challenge_field = await _unique_actionable(
+            page.locator(GENERIC_INPUT_SELECTOR),
+            "X verification field is ambiguous",
+        )
+        transition_field = None
+        if password_field is None and challenge_field is None and transition is not None:
+            transition_field = await _unique_actionable(
+                page.locator(transition["selector"]),
+                "X login field is ambiguous",
+            )
+        text = await _body_text(
+            page,
+            anchor=challenge_field or password_field or transition_field,
+        )
         classification = _classify_text(text)
         if classification == "unsupported":
             raise XBrowserUnsupportedChallenge("X requested an unsupported challenge")
         if classification == "rate_limited":
             raise XBrowserRateLimited("X temporarily limited login attempts")
+        if classification == "transient":
+            raise XBrowserTransientError()
         if classification == "credentials":
             raise XBrowserCredentialsRejected("X rejected the account credentials")
         if transition is not None:
@@ -373,16 +688,9 @@ async def _wait_for_stage(
                 await page.wait_for_timeout(200)
                 continue
             transition = None
-        if allow_password:
-            if await _unique_actionable(
-                page.locator(PASSWORD_SELECTOR),
-                "X password field is ambiguous",
-            ) is not None:
-                return "password", None
-        if await _unique_actionable(
-            page.locator(GENERIC_INPUT_SELECTOR),
-            "X verification field is ambiguous",
-        ) is not None:
+        if password_field is not None:
+            return "password", None
+        if challenge_field is not None:
             if classification in {
                 "alternate_identifier", "verification", "two_factor",
             }:
@@ -416,13 +724,6 @@ async def _wait_for_initial_login_stage(
         names = {item.get("name") for item in cookies if isinstance(item, dict)}
         if {"auth_token", "ct0"}.issubset(names):
             return "success", cookies
-        classification = _classify_text(await _body_text(page))
-        if classification == "unsupported":
-            raise XBrowserUnsupportedChallenge("X requested an unsupported challenge")
-        if classification == "rate_limited":
-            raise XBrowserRateLimited("X temporarily limited login attempts")
-        if classification == "credentials":
-            raise XBrowserCredentialsRejected("X rejected the account credentials")
         username = await _unique_actionable(
             page.locator(USERNAME_SELECTOR),
             "X username field is ambiguous",
@@ -431,6 +732,18 @@ async def _wait_for_initial_login_stage(
             page.locator(PASSWORD_SELECTOR),
             "X password field is ambiguous",
         )
+        classification = _classify_text(await _body_text(
+            page,
+            anchor=password or username,
+        ))
+        if classification == "unsupported":
+            raise XBrowserUnsupportedChallenge("X requested an unsupported challenge")
+        if classification == "rate_limited":
+            raise XBrowserRateLimited("X temporarily limited login attempts")
+        if classification == "transient":
+            raise XBrowserTransientError()
+        if classification == "credentials":
+            raise XBrowserCredentialsRejected("X rejected the account credentials")
         if username is not None:
             return ("static" if password is not None else "username"), None
         if password is not None:
@@ -450,7 +763,7 @@ async def _capture_transition(page, field, selector):
         handle = None
     if handle is None:
         raise XBrowserPageChanged("X login field identity is unavailable")
-    body = await _body_text(page)
+    body = await _body_text(page, anchor=field)
     return {
         "handle": handle,
         "url": str(page.url),
@@ -748,6 +1061,7 @@ async def _obtain_cookies(
     credentials,
     challenge_handler,
     *,
+    progress_handler=None,
     cancel_event=None,
     playwright_factory=None,
 ):
@@ -756,6 +1070,10 @@ async def _obtain_cookies(
     if _unsafe_debug_environment():
         raise XBrowserUnavailable("Unsafe browser diagnostics are enabled")
     username, password, alternate = _validate_credentials(credentials)
+    # This mapping is an internal one-shot handoff from XReader.  Once the
+    # values have been copied, erase it before Playwright or any progress
+    # callback can await and retain an unnecessary second password copy.
+    credentials.clear()
     starter = manager = browser = context = page = None
     try:
         if playwright_factory is None:
@@ -803,6 +1121,7 @@ async def _obtain_cookies(
         initial_stage, cookies = await _wait_for_initial_login_stage(
             page, context, cancel_event=cancel_event,
         )
+        await _report_progress(progress_handler, "page_ready")
         static_form = initial_stage == "static"
         if initial_stage == "success":
             return playwright_to_twikit(cookies)
@@ -810,6 +1129,8 @@ async def _obtain_cookies(
             transition = await _fill_and_submit_static_form(page, username, password)
             username = None
             password = None
+            await _report_progress(progress_handler, "username_submitted")
+            await _report_progress(progress_handler, "password_submitted")
             stage, cookies = await _wait_for_stage(
                 page, context, cancel_event=cancel_event,
                 transition=transition,
@@ -817,6 +1138,7 @@ async def _obtain_cookies(
         elif initial_stage == "username":
             transition = await _fill_and_next(page, USERNAME_SELECTOR, username)
             username = None
+            await _report_progress(progress_handler, "username_submitted")
             stage, cookies = await _wait_for_stage(
                 page, context, cancel_event=cancel_event,
                 allow_password=True,
@@ -836,6 +1158,7 @@ async def _obtain_cookies(
                     page, PASSWORD_SELECTOR, password, login=True,
                 )
                 password = None
+                await _report_progress(progress_handler, "password_submitted")
                 password_submitted = True
                 stage, cookies = await _wait_for_stage(
                     page,
@@ -897,6 +1220,7 @@ async def obtain_cookies(
     credentials,
     challenge_handler,
     *,
+    progress_handler=None,
     cancel_event=None,
     total_timeout=TOTAL_TIMEOUT,
     playwright_factory=None,
@@ -906,6 +1230,7 @@ async def obtain_cookies(
         _obtain_cookies(
             credentials,
             challenge_handler,
+            progress_handler=progress_handler,
             cancel_event=cancel_event,
             playwright_factory=playwright_factory,
         )

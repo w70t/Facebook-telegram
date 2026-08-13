@@ -372,7 +372,7 @@ def test_other_account_cooldown_starting_during_delete_does_not_block_browser(
         )
         return True
 
-    async def login_interactive(credentials, _challenge_handler):
+    async def login_interactive(credentials, _challenge_handler, **_kwargs):
         login_calls.append(credentials["username"])
         return False
 
@@ -670,7 +670,7 @@ def test_rate_limit_clears_credentials_before_countdown_rpc(app, monkeypatch):
     credential_refs = []
     activation_checks = []
 
-    async def rate_limited(credentials, _challenge_handler):
+    async def rate_limited(credentials, _challenge_handler, **_kwargs):
         credential_refs.append(credentials)
         raise app.XBrowserRateLimited("internal detail")
 
@@ -1078,7 +1078,7 @@ async def _wait_for_x_code_state(app):
 def test_x_authenticator_code_round_trip_is_deleted_and_not_stored(app, monkeypatch):
     captured = {}
 
-    async def fake_login(credentials, challenge_handler):
+    async def fake_login(credentials, challenge_handler, **_kwargs):
         captured["credentials"] = dict(credentials)
         captured["code"] = await challenge_handler("two_factor", "hidden prompt")
         app.xreader.active = credentials["username"]
@@ -1128,7 +1128,7 @@ def test_x_authenticator_code_round_trip_is_deleted_and_not_stored(app, monkeypa
 def test_x_authenticator_code_is_bound_to_original_private_chat(app, monkeypatch):
     captured = []
 
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         captured.append(await challenge_handler("two_factor", "hidden prompt"))
         app.xreader.active = "reader"
         return True
@@ -1170,7 +1170,7 @@ def test_x_additional_verification_accepts_phone_format_requested_by_x(
 ):
     captured = []
 
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         captured.append(await challenge_handler("verification", "hidden prompt"))
         app.xreader.active = "reader"
         return True
@@ -1446,7 +1446,7 @@ def test_same_flow_cancel_button_stops_running_x_login(app, monkeypatch):
     release_login = None
     saved = []
 
-    async def fake_login(_credentials, _challenge_handler):
+    async def fake_login(_credentials, _challenge_handler, **_kwargs):
         login_started.set()
         await release_login.wait()
         return True
@@ -1673,7 +1673,7 @@ def test_callback_rechecks_x_setup_after_await(app, monkeypatch, kind):
 def test_x_password_delete_failure_aborts_before_login(app, monkeypatch):
     called = []
 
-    async def fake_login(*args):
+    async def fake_login(*args, **_kwargs):
         called.append(args)
 
     monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
@@ -1694,7 +1694,7 @@ def test_x_password_delete_failure_aborts_before_login(app, monkeypatch):
 def test_x_password_is_not_trimmed_and_may_start_with_slash(app, monkeypatch):
     captured = []
 
-    async def fake_login(credentials, _challenge_handler):
+    async def fake_login(credentials, _challenge_handler, **_kwargs):
         captured.append(dict(credentials))
         app.xreader.active = credentials["username"]
         return True
@@ -1760,7 +1760,7 @@ def test_legacy_command_handler_stops_generic_dispatch(app, handler):
 def test_first_telegram_response_failure_releases_x_login_lock(app, monkeypatch):
     called = []
 
-    async def fake_login(*args):
+    async def fake_login(*args, **_kwargs):
         called.append(args)
 
     monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
@@ -1784,7 +1784,7 @@ def test_cancel_during_password_deletion_prevents_x_login(app, monkeypatch):
     delete_started = None
     release_delete = None
 
-    async def fake_login(*args):
+    async def fake_login(*args, **_kwargs):
         login_calls.append(args)
         return True
 
@@ -1830,7 +1830,7 @@ def test_hung_password_delete_times_out_and_releases_secret_lock(app, monkeypatc
     login_calls = []
     monkeypatch.setattr(app, "X_SECRET_DELETE_TIMEOUT", 0.01)
 
-    async def fake_login(*args):
+    async def fake_login(*args, **_kwargs):
         login_calls.append(args)
         return True
 
@@ -1862,7 +1862,7 @@ def test_session_switch_during_login_notice_prevents_old_x_attempt(app, monkeypa
     release_notice = None
     login_calls = []
 
-    async def fake_login(*args):
+    async def fake_login(*args, **_kwargs):
         login_calls.append(args)
         return True
 
@@ -1993,7 +1993,7 @@ def test_purged_x_code_state_leaves_full_length_tombstone(app):
 
 
 def test_x_code_delete_failure_cancels_login_without_saving(app, monkeypatch):
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         await challenge_handler("two_factor", "hidden prompt")
         return True
 
@@ -2020,7 +2020,7 @@ def test_x_code_delete_failure_cancels_login_without_saving(app, monkeypatch):
 
 
 def test_x_authenticator_timeout_does_not_save_credentials(app, monkeypatch):
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         await challenge_handler("two_factor", "hidden prompt")
         return True
 
@@ -2048,7 +2048,7 @@ def test_x_authenticator_timeout_does_not_save_credentials(app, monkeypatch):
 
 
 def test_cancel_stops_x_authenticator_attempt_without_saving(app, monkeypatch):
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         await challenge_handler("two_factor", "hidden prompt")
         return True
 
@@ -2075,7 +2075,7 @@ def test_cancel_stops_x_authenticator_attempt_without_saving(app, monkeypatch):
 
 
 def test_x_login_failure_is_sanitized_and_does_not_persist(app, monkeypatch):
-    async def fake_login(_credentials, _challenge_handler):
+    async def fake_login(_credentials, _challenge_handler, **_kwargs):
         raise RuntimeError("secret server detail")
 
     monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
@@ -2093,7 +2093,7 @@ def test_x_login_failure_is_sanitized_and_does_not_persist(app, monkeypatch):
 
 def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch, caplog):
     caplog.set_level(20, logger="tg2fb")
-    async def fake_login(_credentials, _challenge_handler):
+    async def fake_login(_credentials, _challenge_handler, **_kwargs):
         raise app.XBrowserRateLimited("fixed internal detail")
 
     monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
@@ -2119,6 +2119,58 @@ def test_x_login_rate_limit_has_a_specific_retry_later_message(app, monkeypatch,
     assert "XLOGIN_STAGE rate_limited" in caplog.text
     assert "do-not-save" not in caplog.text
     assert "fixed internal detail" not in caplog.text
+
+
+def test_x_login_progress_and_rate_stage_are_safe(app, monkeypatch, caplog):
+    caplog.set_level(20, logger="tg2fb")
+
+    async def fake_login(credentials, _challenge_handler, progress_handler=None):
+        assert progress_handler is not None
+        await progress_handler("page_ready")
+        await progress_handler("username_submitted")
+        await progress_handler("password_submitted")
+        raise app.XBrowserRateLimited("hidden remote detail")
+
+    monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
+    event = Event(text="secret-progress-password")
+    asyncio.run(app._save_x_login(
+        event,
+        {"x_username": "progress_user", "x_email": None},
+        event.text,
+    ))
+
+    replies = "\n".join(event.responses)
+    assert "بعد إرسال كلمة المرور" in replies
+    assert "secret-progress-password" not in replies
+    assert "progress_user" not in replies
+    assert "XLOGIN_STAGE rate_limited_after_password" in caplog.text
+    assert "secret-progress-password" not in caplog.text
+    assert "hidden remote detail" not in caplog.text
+
+
+def test_x_login_transient_retry_does_not_start_cooldown(app, monkeypatch, caplog):
+    caplog.set_level(20, logger="tg2fb")
+
+    async def fake_login(_credentials, _challenge_handler, progress_handler=None):
+        assert progress_handler is not None
+        await progress_handler("page_ready")
+        raise app.XBrowserTransientError("hidden transient detail")
+
+    monkeypatch.setattr(app.xreader, "login_interactive", fake_login)
+    event = Event(text="transient-secret")
+    asyncio.run(app._save_x_login(
+        event,
+        {"x_username": "transient_user", "x_email": None},
+        event.text,
+    ))
+
+    assert app.S.x_login_cooldowns() == {}
+    assert app.S.x_login_cooldown() is None
+    replies = "\n".join(event.responses)
+    assert "لم أبدأ عداد ساعة" in replies
+    assert "transient-secret" not in replies
+    assert "hidden transient detail" not in replies
+    assert "XLOGIN_STAGE transient_retry" in caplog.text
 
 
 def test_second_admin_cannot_overlap_x_login_attempt(app):
@@ -2149,7 +2201,7 @@ def test_x_settings_save_failure_discards_verified_session(app, monkeypatch):
         discarded.append(username)
         return True
 
-    async def fake_login(credentials, _challenge_handler):
+    async def fake_login(credentials, _challenge_handler, **_kwargs):
         app.xreader.active = credentials["username"]
         app.xreader.ready = True
         return True
@@ -2198,7 +2250,7 @@ def test_revoked_admin_cannot_finish_x_login_or_keep_session(app, monkeypatch):
     allow_return = None
     discarded = []
 
-    async def fake_login(credentials, _challenge_handler):
+    async def fake_login(credentials, _challenge_handler, **_kwargs):
         app.xreader.active = credentials["username"]
         app.xreader.ready = True
         login_returned.set()
@@ -2245,7 +2297,7 @@ def test_revocation_warns_owner_when_new_x_session_cannot_be_deleted(
     allow_return = None
     warnings = []
 
-    async def fake_login(credentials, _challenge_handler):
+    async def fake_login(credentials, _challenge_handler, **_kwargs):
         app.xreader.active = credentials["username"]
         app.xreader.ready = True
         login_returned.set()
@@ -2283,7 +2335,7 @@ def test_revocation_warns_owner_when_new_x_session_cannot_be_deleted(
 
 
 def test_revoked_admin_challenge_is_cancelled_without_saving(app, monkeypatch):
-    async def fake_login(_credentials, challenge_handler):
+    async def fake_login(_credentials, challenge_handler, **_kwargs):
         await challenge_handler("two_factor", "hidden prompt")
         return True
 

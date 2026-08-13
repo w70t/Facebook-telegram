@@ -91,6 +91,11 @@ class FakeLocator:
         return self
 
     async def evaluate(self, _expression):
+        if "NodeFilter.SHOW_TEXT" in _expression:
+            text = self._visible_body_text()
+            if self.selector == "body":
+                return text + self.page.outside_active_text
+            return self.page.scoped_body_text or text
         if self.selector == xbrowser.PASSWORD_SELECTOR and self.page.state == "jf_username":
             return False
         return self._visible()
@@ -135,6 +140,9 @@ class FakeLocator:
         self.page.advance(self.page.stages.pop(0))
 
     async def inner_text(self, **_kwargs):
+        return self._visible_body_text() + self.page.hidden_body_text
+
+    def _visible_body_text(self):
         return {
             "alternate": "Confirm your email or phone number",
             "verification": "Enter the verification code sent to your email",
@@ -143,6 +151,8 @@ class FakeLocator:
             "verification_rejected": "Incorrect code. Try again with the verification code",
             "unsupported": "Complete this CAPTCHA with a security key",
             "credentials": "Wrong password",
+            "rate_limited": "We've temporarily limited your login",
+            "transient": "X could not complete this request. Try again later.",
         }.get(self.page.state, "Sign in to X")
 
     def locator(self, selector):
@@ -194,6 +204,9 @@ class FakePage:
         self.fail_transition_evaluate = False
         self.form_submit_count = form_submit_count
         self.clicked_locators = []
+        self.hidden_body_text = ""
+        self.outside_active_text = ""
+        self.scoped_body_text = ""
 
     def advance(self, next_state):
         async def later():
@@ -414,6 +427,121 @@ def test_current_jf_failure_messages_are_classified_without_remote_details():
     ) == "rate_limited"
 
 
+def test_generic_retry_later_is_transient_not_rate_limited():
+    assert xbrowser._classify_text(
+        "X could not complete this request. Please try again later."
+    ) == "transient"
+
+
+def test_specific_failure_wins_over_generic_retry_later_suffix():
+    assert xbrowser._classify_text(
+        "Wrong password. Please try again later."
+    ) == "credentials"
+    assert xbrowser._classify_text(
+        "Incorrect code. Try again later using your authentication app."
+    ) == "two_factor"
+
+
+def test_hidden_responsive_rate_limit_template_is_not_classified():
+    _factory, page, _browser, _events = fake_runtime([])
+    page.state = "username"
+    page.hidden_body_text = "We've temporarily limited your login."
+
+    async def scenario():
+        # The old whole-body innerText approach sees the hidden copy.
+        raw = await page.locator("body").inner_text()
+        assert xbrowser._classify_text(raw) == "rate_limited"
+        # The production helper uses its visibility/viewport-filtered DOM walk.
+        visible = await xbrowser._body_text(page)
+        assert xbrowser._classify_text(visible) is None
+
+    asyncio.run(scenario())
+
+
+def test_stage_text_is_bound_to_active_form_not_visible_page_sidebar():
+    _factory, page, _browser, _events = fake_runtime([])
+    page.state = "username"
+    page.outside_active_text = " We've temporarily limited your login."
+
+    async def scenario():
+        global_text = await xbrowser._body_text(page)
+        assert xbrowser._classify_text(global_text) == "rate_limited"
+        username = await xbrowser._unique_actionable(
+            page.locator(xbrowser.USERNAME_SELECTOR), "ambiguous",
+        )
+        scoped_text = await xbrowser._body_text(page, anchor=username)
+        assert xbrowser._classify_text(scoped_text) is None
+
+    asyncio.run(scenario())
+
+
+def test_initial_stage_ignores_unrelated_visible_limit_copy_outside_active_form():
+    factory, page, _browser, _events = fake_runtime([])
+    page.state = "username"
+    page.outside_active_text = " We've temporarily limited your login."
+    context = factory.starter.manager.chromium.browser.context
+
+    stage, cookies = asyncio.run(xbrowser._wait_for_initial_login_stage(
+        page, context, timeout_ms=20,
+    ))
+
+    assert stage == "username"
+    assert cookies is None
+
+
+def test_visible_text_policy_rejects_all_reviewed_hidden_geometry():
+    source = xbrowser._VISIBLE_STAGE_TEXT_JS
+    for required in (
+        "current.hidden", "current.inert", "hasAttribute('inert')",
+        "aria-hidden", "contentVisibility", "effectiveOpacity",
+        "webkitTextFillColor", "clipPath", "style.clip",
+        "overflowX", "overflowY", "window.innerWidth", "window.innerHeight",
+        "[role=\"alert\"]", "anchor.closest('form')",
+    ):
+        assert required in source
+
+
+def test_optional_passkey_offer_is_not_a_forced_unsupported_challenge():
+    assert xbrowser._classify_text(
+        "Sign in to X. Sign in with a passkey."
+    ) is None
+    assert xbrowser._classify_text(
+        "Use your passkey to continue."
+    ) == "unsupported"
+
+
+def test_specific_failure_precedes_explicit_limit_copy():
+    assert xbrowser._classify_text(
+        "Wrong password. We've temporarily limited your login. Try again later."
+    ) == "credentials"
+    assert xbrowser._classify_text(
+        "Enter the code from your authentication app. Too many login attempts."
+    ) == "two_factor"
+
+
+def test_transient_retry_page_fails_closed_without_starting_rate_limit():
+    factory, page, _browser, events = fake_runtime(["transient"])
+
+    with pytest.raises(xbrowser.XBrowserTransientError) as caught:
+        run_login(factory, lambda *_args: None)
+
+    assert caught.value.reason == "retry_later"
+    assert page.fills == [("username", "reader")]
+    assert page.clicks == ["username"]
+    assert events[-1] == "manager.stop"
+
+
+def test_explicit_rate_limit_marker_still_raises_rate_limited():
+    factory, page, _browser, events = fake_runtime(["rate_limited"])
+
+    with pytest.raises(xbrowser.XBrowserRateLimited):
+        run_login(factory, lambda *_args: None)
+
+    assert page.fills == [("username", "reader")]
+    assert page.clicks == ["username"]
+    assert events[-1] == "manager.stop"
+
+
 def test_browser_login_without_challenge_returns_memory_cookies_and_closes_all():
     factory, page, browser, events = fake_runtime(["password", "success"])
 
@@ -425,6 +553,52 @@ def test_browser_login_without_challenge_returns_memory_cookies_and_closes_all()
     assert browser.launch_kwargs == {"headless": True, "chromium_sandbox": True}
     assert browser.context_kwargs["accept_downloads"] is False
     assert events == ["page.close", "context.close", "browser.close", "manager.stop"]
+
+
+def test_browser_progress_reports_only_reviewed_milestones():
+    factory, _page, _browser, _events = fake_runtime(["password", "success"])
+    progress = []
+
+    async def report(stage):
+        progress.append(stage)
+
+    result = run_login(factory, lambda *_args: None, progress_handler=report)
+
+    assert result["auth_token"] == "auth-value"
+    assert progress == [
+        "page_ready", "username_submitted", "password_submitted",
+    ]
+
+
+def test_browser_erases_one_shot_credentials_before_progress_callback():
+    factory, _page, _browser, _events = fake_runtime(["password", "success"])
+    credentials = {
+        "username": "reader",
+        "email": None,
+        "password": "account-password",
+    }
+
+    async def report(_stage):
+        assert credentials == {}
+
+    result = run_login(
+        factory, lambda *_args: None, credentials,
+        progress_handler=report,
+    )
+
+    assert result["auth_token"] == "auth-value"
+    assert credentials == {}
+
+
+def test_browser_progress_rejects_non_allowlisted_stage():
+    received = []
+
+    async def report(stage):
+        received.append(stage)
+
+    with pytest.raises(xbrowser.XBrowserPageChanged):
+        asyncio.run(xbrowser._report_progress(report, "raw-dom-text"))
+    assert received == []
 
 
 def test_browser_waits_for_lazy_initial_form_before_filling_any_value():
