@@ -116,8 +116,8 @@ def _require_client_api(client):
         raise XAuthCompatibilityError("مخزن cookies في Twikit غير متوافق")
 
 
-async def _challenge_response(handler, kind):
-    value = await handler(kind, "")
+async def _challenge_response(handler, kind, prompt=""):
+    value = await handler(kind, prompt)
     if not isinstance(value, str) or not value.strip():
         raise XChallengeResponseError("لم يصل رمز تحقق صالح")
     return value.strip()
@@ -199,10 +199,22 @@ async def login_with_challenges(
     })
 
     if flow.task_id == "LoginEnterAlternateIdentifierSubtask":
-        await flow.execute_task({
+        alternate_identifier = auth_info_2
+        if not alternate_identifier:
+            # Twikit الأصلي يلجأ إلى input() هنا إذا لم يمرر المستدعي البريد أو
+            # الهاتف. نوجّه الطلب إلى Telegram كي يبقى البوت غير تفاعلي مع stdin.
+            alternate_identifier = await _challenge_response(
+                challenge_handler, "verification", "alternate_identifier"
+            )
+        alternate_payload = {
             "subtask_id": "LoginEnterAlternateIdentifierSubtask",
-            "enter_text": {"text": auth_info_2 or auth_info_1, "link": "next_link"},
-        })
+            "enter_text": {"text": alternate_identifier, "link": "next_link"},
+        }
+        try:
+            await flow.execute_task(alternate_payload)
+        finally:
+            alternate_payload["enter_text"]["text"] = None
+            alternate_identifier = None
     if flow.task_id == "DenyLoginSubtask":
         _deny("credentials")
 

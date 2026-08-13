@@ -42,6 +42,7 @@ class Flow:
     after_password = ["AccountDuplicationCheck"]
     after_identifier = ["LoginEnterAlternateIdentifierSubtask"]
     challenge_results = []
+    alternate_values = []
     instances = []
 
     def __init__(self, client, guest_token):
@@ -73,6 +74,7 @@ class Flow:
         elif task_id == "LoginEnterUserIdentifierSSO":
             next_task = type(self).after_identifier[0]
         elif task_id == "LoginEnterAlternateIdentifierSubtask":
+            type(self).alternate_values.append(payload["enter_text"]["text"])
             next_task = "LoginEnterPassword"
         elif task_id == "LoginEnterPassword":
             next_task = type(self).after_password[0]
@@ -94,6 +96,7 @@ def fake_twikit(monkeypatch):
     Flow.after_password = ["AccountDuplicationCheck"]
     Flow.after_identifier = ["LoginEnterAlternateIdentifierSubtask"]
     Flow.challenge_results = []
+    Flow.alternate_values = []
     Flow.instances = []
     monkeypatch.setattr(
         xauth,
@@ -129,6 +132,22 @@ def test_login_without_challenge_never_reads_stdin(monkeypatch):
     assert client.http.cookies.cleared is True
     assert client._user_id == "42"
     assert called == []
+
+
+def test_missing_alternate_identifier_is_requested_without_stdin(monkeypatch):
+    monkeypatch.setattr(
+        builtins, "input", lambda *_args: (_ for _ in ()).throw(AssertionError("stdin"))
+    )
+    calls = []
+
+    async def handler(kind, prompt):
+        calls.append((kind, prompt))
+        return "+49 170 1234567"
+
+    run_login(Client(), handler, auth_info_2=None)
+
+    assert calls == [("verification", "alternate_identifier")]
+    assert Flow.alternate_values == ["+49 170 1234567"]
 
 
 def test_verification_then_authenticator_and_wrong_code_retry(monkeypatch):

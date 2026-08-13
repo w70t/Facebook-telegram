@@ -8,12 +8,18 @@ import logging
 import os
 import re
 import tempfile
+from collections import namedtuple
 
 from settings import SETTINGS_FILE
 
 BASE_DIR = os.path.dirname(os.path.abspath(SETTINGS_FILE))
 
 log = logging.getLogger("tg2fb.x")
+SessionRef = namedtuple("SessionRef", "generation client username")
+
+
+class XSessionSuperseded(RuntimeError):
+    """أُبطلت محاولة تفعيل/دخول لأن عملية أحدث غيّرت جلسة X."""
 
 # لا نعلّم الحساب failed إلا عند دليل قطعي على بيانات اعتماد خاطئة أو تعطيل الحساب.
 # 403/Forbidden وblocked/denied قد تكون قيود endpoint أو rate-limit وليست دليلاً.
@@ -31,6 +37,9 @@ AUTH_EXC_NAMES = {
 }
 
 ACCOUNT_DISABLED_EXC_NAMES = {"AccountSuspended", "AccountLocked"}
+INTERACTIVE_AUTH_EXC_NAMES = {
+    "XCredentialsRejected", "AccountSuspended", "AccountLocked",
+}
 ACCOUNT_DISABLED_HINTS = re.compile(
     r"\b(?:account\s+(?:(?:is|has\s+been)\s+)?(?:suspend\w*|locked)|"
     r"suspended\s+account)\b",
@@ -44,8 +53,84 @@ SESSION_INVALID_HINTS = re.compile(
 
 
 def _cookies_path(username):
+    # X usernames are case-insensitive. Canonical lower-case prevents orphaned
+    # session files when an admin later types a different casing on Linux.
+    safe = re.sub(r"\W+", "_", username or "x").lower()
+    return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
+
+
+def _legacy_cookies_path(username):
     safe = re.sub(r"\W+", "_", username or "x")
     return os.path.join(BASE_DIR, f"x_cookies_{safe}.json")
+
+
+def _cookie_alias_paths(username):
+    """يعيد كل ملفات الجلسة العادية المطابقة للاسم دون حساسية الأحرف.
+
+    البحث direct-child فقط ولا يتبع symlinks. هذا يلتقط أسماء الإصدارات القديمة
+    مثل ``x_cookies_Reader.json`` حتى لو صار الاسم المخزن لاحقاً ``reader``.
+    """
+    canonical = os.path.abspath(_cookies_path(username))
+    directory = os.path.dirname(canonical) or "."
+    expected = os.path.basename(canonical).casefold()
+    aliases = []
+    unsafe_match = False
+    try:
+        entries = os.scandir(directory)
+    except OSError as e:
+        log.warning("تعذّر فحص ملفات جلسة X (%s)", type(e).__name__)
+        return canonical, aliases, True
+    with entries:
+        for entry in entries:
+            if entry.name.casefold() != expected:
+                continue
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    aliases.append(os.path.abspath(entry.path))
+                else:
+                    unsafe_match = True
+            except OSError:
+                unsafe_match = True
+    return canonical, aliases, unsafe_match
+
+
+def _same_cookie_path(left, right):
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
+
+
+def _canonicalize_cookie_path(username):
+    """ينقل اسم ملف قديم حساساً للأحرف إلى الاسم القانوني الصغير ذرّياً."""
+    canonical, aliases, unsafe_match = _cookie_alias_paths(username)
+    canonical_alias = next(
+        (path for path in aliases if _same_cookie_path(path, canonical)), None
+    )
+    source = canonical_alias
+    if source is None and aliases:
+        # إذا وُجد أكثر من alias قديم نأخذ الأحدث، ثم نمسح البقية بعد نجاح النقل.
+        try:
+            source = max(aliases, key=lambda path: os.stat(path).st_mtime_ns)
+        except OSError:
+            source = aliases[0]
+    if source is not None and not _same_cookie_path(source, canonical):
+        try:
+            os.replace(source, canonical)
+            _restrict(canonical)
+        except OSError as e:
+            log.warning("تعذّر ترحيل اسم ملف جلسة X (%s)", type(e).__name__)
+            return source
+    for alias in aliases:
+        if _same_cookie_path(alias, canonical) or alias == source:
+            continue
+        try:
+            os.remove(alias)
+        except OSError as e:
+            log.warning("تعذّر حذف alias قديم لجلسة X (%s)", type(e).__name__)
+    if source is None and unsafe_match:
+        log.warning("رُفض ملف جلسة X غير عادي")
+        return None
+    return canonical
 
 
 def _restrict(path, *, required=False):
@@ -128,16 +213,23 @@ def _drop_cookies(username):
     يحذف ملف الكوكيز. بدون هذا كانت الكوكيز المنتهية تُحمّل مجدداً إلى ما لا نهاية
     فيبقى الحساب "فاشلاً" حتى بعد الضغط على زر ♻️ إعادة التفعيل.
     """
-    path = _cookies_path(username)
-    try:
-        os.remove(path)
+    _canonical, paths, unsafe_match = _cookie_alias_paths(username)
+    ok = True
+    removed = False
+    for path in paths:
+        try:
+            os.remove(path)
+            removed = True
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            ok = False
+            log.warning("تعذّر حذف ملف جلسة X (%s)", type(e).__name__)
+    if removed:
         log.info("حُذفت كوكيز X غير الصالحة")
-        return True
-    except FileNotFoundError:
-        return True
-    except OSError as e:
-        log.warning("تعذّر حذف ملف جلسة X (%s)", type(e).__name__)
-        return False
+    if unsafe_match:
+        log.warning("تُرك alias غير عادي لملف جلسة X دون اتباعه")
+    return ok and not unsafe_match
 
 
 def is_auth_error(exc):
@@ -181,6 +273,7 @@ class XReader:
         self.client = None
         self.active = None      # اسم الحساب النشط حالياً
         self.ready = False
+        self._session_generation = 0
 
     def _new_client(self):
         from twikit import Client  # استيراد كسول
@@ -189,15 +282,22 @@ class XReader:
 
     def invalidate(self):
         """يُبطل الجلسة الحالية ليُعاد اختيار حساب نشط."""
+        self._session_generation += 1
         self.client = None
         self.active = None
         self.ready = False
+        return self._session_generation
 
     def discard_session(self, username):
         """يحذف جلسة دخول لم نستطع تثبيت إعداداتها محلياً."""
+        # الحذف mutation حتى لو لم يكن الحساب active بعد. رفع الجيل أولاً يمنع
+        # verify قديم جارٍ من إعادة تفعيل cookie حُذفت للتو.
+        self._session_generation += 1
         removed = _drop_cookies(username)
         if self.active and self.active.lower() == str(username).lower():
-            self.invalidate()
+            self.client = None
+            self.active = None
+            self.ready = False
         return removed
 
     @staticmethod
@@ -213,14 +313,36 @@ class XReader:
         await client.get_user_by_screen_name(username)
 
     def _set_active(self, client, username):
+        self._session_generation += 1
         self.client = client
         self.active = username
         self.ready = True
         log.info("تم تفعيل جلسة X")
 
+    def capture_session(self):
+        """يلتقط مرجعاً ثابتاً يمنع خطأ طلب قديم من إتلاف جلسة أحدث."""
+        if not (self.ready and self.client is not None and self.active):
+            return None
+        return SessionRef(self._session_generation, self.client, self.active)
+
+    def _session_matches(self, session):
+        return bool(
+            session is not None
+            and session.generation == self._session_generation
+            and session.client is self.client
+            and str(session.username).lower() == str(self.active).lower()
+        )
+
+    def _require_generation(self, generation):
+        if generation != self._session_generation:
+            raise XSessionSuperseded("X session changed during authentication")
+
+    def is_generation_current(self, generation):
+        return generation == self._session_generation
+
     def _mark_failed_if_auth(self, username, exc, *, drop_cookies=False):
         """لا يحرق حساباً بسبب timeout/challenge/network عابر."""
-        if not is_auth_error(exc):
+        if type(exc).__name__ not in INTERACTIVE_AUTH_EXC_NAMES:
             return False
         if drop_cookies:
             _drop_cookies(username)
@@ -229,14 +351,17 @@ class XReader:
 
     async def _activate_cookie(self, cred):
         """يحمّل جلسة موجودة فقط؛ لا يلمس كلمة المرور أو مدخلات Twikit."""
+        generation = self._session_generation
         username = cred["username"]
-        cpath = _cookies_path(username)
-        if not os.path.exists(cpath):
+        cpath = _canonicalize_cookie_path(username)
+        if cpath is None or not os.path.exists(cpath):
             return False
         client = self._new_client()
         _restrict(cpath)              # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
         client.load_cookies(cpath)
         await self._verify(client, username)
+        if generation != self._session_generation:
+            return False
         self._set_active(client, username)
         return True
 
@@ -248,7 +373,7 @@ class XReader:
         password = cred.get("password")
         if not username or not password:
             raise ValueError("اسم مستخدم X وكلمة المرور مطلوبان")
-        return username, cred.get("email") or username, password
+        return username, cred.get("email"), password
 
     async def login_interactive(self, cred, challenge_handler):
         """
@@ -260,6 +385,7 @@ class XReader:
         """
         if not callable(challenge_handler):
             raise TypeError("challenge_handler يجب أن يكون callable")
+        generation = self._session_generation
         username, auth_info_2, password = self._validate_credential(cred)
         client = self._new_client()
         try:
@@ -272,17 +398,26 @@ class XReader:
                 password=password,
                 challenge_handler=challenge_handler,
             )
+            self._require_generation(generation)
             await self._verify(client, username)
+            self._require_generation(generation)
         except Exception as e:  # noqa: BLE001
-            self._mark_failed_if_auth(username, e)
+            # نتيجة محاولة قديمة لا تملك صلاحية تعطيل credential بعد أن بدّلت
+            # عملية أحدث الجلسة/الحساب؛ وإلا قد يحرق خطأ متأخر الحساب الصحيح.
+            if self.is_generation_current(generation):
+                self._mark_failed_if_auth(username, e)
             log.warning("فشل تسجيل X التفاعلي (%s)", type(e).__name__)
             raise
 
         cpath = _cookies_path(username)
         try:
+            self._require_generation(generation)
             # الكوكيز = جلسة دخول X كاملة. نكتب ملفاً مؤقتاً خاصاً بعد verify ثم
             # نستبدل الملف النهائي ذرّياً، فلا نفقد جلسة سابقة عند فشل القرص.
             _save_cookies_atomic(client, cpath)
+            # لا توجد await بين الحارس والكتابة/التفعيل؛ فلا تستطيع coroutine
+            # أخرى تبديل الجلسة داخل هذا المقطع المتزامن من حلقة asyncio.
+            self._require_generation(generation)
         except Exception as e:  # noqa: BLE001
             log.warning("تعذّر حفظ جلسة X المتحققة (%s)", type(e).__name__)
             raise
@@ -304,10 +439,15 @@ class XReader:
         for cred in credentials:
             if cred.get("failed"):
                 continue
+            generation = self._session_generation
             try:
                 if await self._activate_cookie(cred):
                     return True
+                if generation != self._session_generation:
+                    return bool(self.ready and self.client is not None)
             except Exception as e:  # noqa: BLE001
+                if generation != self._session_generation:
+                    return bool(self.ready and self.client is not None)
                 # 401/session-expired يبطل الجلسة فقط؛ لا يثبت أن كلمة المرور
                 # خاطئة. قفل/تعليق الحساب وحده يبرر failed في مسار الخلفية.
                 if _is_session_invalid(e):
@@ -328,13 +468,15 @@ class XReader:
                     return await self.login_interactive(cred, challenge_handler)
         return False
 
-    def report_failure(self, exc):
+    def report_failure(self, exc, *, session=None):
         """يعالج فشل جلسة الجلب دون الخلط بين cookie ميتة وحساب معطّل."""
+        if not self._session_matches(session):
+            return False
         session_invalid = _is_session_invalid(exc)
         definitive_auth = is_auth_error(exc)
         if not self.active or not (session_invalid or definitive_auth):
             return False
-        username = self.active
+        username = session.username
         _drop_cookies(username)
         # 401/session-expired أثناء الجلب يثبت بطلان cookie لا بطلان كلمة
         # المرور. أما قفل الحساب أو رسالة credentials/password الصريحة فقط
@@ -347,7 +489,10 @@ class XReader:
     async def resolve(self, screen_name):
         if not await self.ensure_login():
             raise RuntimeError("لا يوجد حساب دخول X صالح")
-        user = await self.client.get_user_by_screen_name(screen_name.lstrip("@"))
+        session = self.capture_session()
+        if session is None:
+            raise RuntimeError("لا يوجد مرجع جلسة X صالح")
+        user = await session.client.get_user_by_screen_name(screen_name.lstrip("@"))
         return str(user.id), getattr(user, "name", screen_name)
 
     async def latest_tweet_id(self, user_id):
@@ -355,8 +500,11 @@ class XReader:
         أحدث معرّف تغريدة الآن — يُستخدم كنقطة بداية عند إضافة حساب جديد حتى لا
         تُرسل عشرون تغريدة قديمة دفعة واحدة إلى قروب المراجعة.
         """
+        session = self.capture_session()
+        if session is None:
+            return None
         try:
-            tweets = await self.client.get_user_tweets(user_id, "Tweets", count=1)
+            tweets = await session.client.get_user_tweets(user_id, "Tweets", count=1)
         except Exception as e:  # noqa: BLE001
             log.warning("تعذّر جلب أحدث تغريدة من X (%s)", type(e).__name__)
             return None
@@ -400,10 +548,18 @@ class XReader:
         fresh.sort(key=sort_key)                      # الأقدم أولاً
         return fresh[:limit] if limit else fresh
 
-    async def fetch_new(self, account):
-        if not await self.ensure_login():
-            raise RuntimeError("لا يوجد حساب دخول X صالح")
-        tweets = await self.client.get_user_tweets(account["user_id"], "Tweets", count=20)
+    async def fetch_new(self, account, *, session=None):
+        if session is None:
+            if not await self.ensure_login():
+                raise RuntimeError("لا يوجد حساب دخول X صالح")
+            session = self.capture_session()
+        if session is None:
+            raise RuntimeError("لا يوجد مرجع جلسة X صالح")
+        tweets = await session.client.get_user_tweets(
+            account["user_id"], "Tweets", count=20
+        )
+        if not self._session_matches(session):
+            raise XSessionSuperseded("X session changed during fetch")
         return self.select_new(
             tweets,
             account,

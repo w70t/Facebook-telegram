@@ -4,12 +4,14 @@
 تبقى القيم الثلاث الأساسية (api_id/api_hash/bot_token) فقط عبر configure.py مرة واحدة.
 """
 import copy
+import json
 import logging
 import os
-import shutil
+import secrets
 import threading
+import time
 
-from jsonio import atomic_write_json, read_json_resilient
+from jsonio import atomic_write_json, read_json
 
 log = logging.getLogger("tg2fb.settings")
 
@@ -44,6 +46,139 @@ DEFAULTS = {
     "pending_ttl_hours": 48,     # عمر المنشور المعلّق قبل حذفه تلقائياً
 }
 
+_BACKUP_FORMAT = 2
+_BACKUP_PREPARED = "prepared"
+_BACKUP_COMMITTED = "committed"
+_PRIMARY_TXID = "__settings_txid"
+
+
+def _valid_txid(value):
+    return isinstance(value, str) and bool(value)
+
+
+def _settings_data(value):
+    """يعيد بيانات الإعدادات المنطقية من دون حقل بروتوكول المعاملة المحجوز."""
+    data = copy.deepcopy(value)
+    data.pop(_PRIMARY_TXID, None)
+    return data
+
+
+def _primary_document(data, txid):
+    document = _settings_data(data)
+    document[_PRIMARY_TXID] = txid
+    return document
+
+
+def _backup_envelope(data, state, txid):
+    return {
+        "format": _BACKUP_FORMAT,
+        "state": state,
+        "txid": txid,
+        "data": _settings_data(data),
+    }
+
+
+def _decode_committed_backup(value):
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("format") != _BACKUP_FORMAT
+        or value.get("state") != _BACKUP_COMMITTED
+        or not _valid_txid(value.get("txid"))
+        or not isinstance(value.get("data"), dict)
+        or _PRIMARY_TXID in value["data"]
+    ):
+        return None
+    return value["txid"], copy.deepcopy(value["data"])
+
+
+def _read_dict(path):
+    try:
+        value = read_json(path)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        return None, exc
+    if not isinstance(value, dict):
+        return None, TypeError("JSON root is not an object")
+    return value, None
+
+
+def _quarantine_corrupt(path):
+    quarantine = f"{path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(path, quarantine)
+    except OSError:
+        return None
+    log.error("نُقل ملف الإعدادات التالف إلى %s", quarantine)
+    return quarantine
+
+
+def _repair_committed_backup(path, data, txid):
+    """يجعل backup مرجعاً committed لنفس primary؛ الفشل لا يبطل primary صالحاً."""
+    backup = path + ".bak"
+    current, error = _read_dict(backup)
+    if error is None and _decode_committed_backup(current) == (txid, data):
+        return True
+    try:
+        atomic_write_json(
+            backup, _backup_envelope(data, _BACKUP_COMMITTED, txid), mode=0o600
+        )
+    except OSError as exc:
+        log.warning("الإعدادات سليمة لكن تعذّر إصلاح النسخة الاحتياطية: %s", exc)
+        return False
+    return True
+
+
+def _migrate_legacy_primary(path, data):
+    """يربط primary قديمة بمعاملة قبل أن يمنح backup القديمة أي ثقة."""
+    txid = secrets.token_hex(16)
+    try:
+        atomic_write_json(path, _primary_document(data, txid), mode=0o600)
+    except OSError as exc:
+        # primary القديمة ما زالت المرجع الصالح. لا نلمس backup القديمة كي تظل
+        # غير موثوقة إن فُقد primary لاحقاً.
+        log.warning("قُرئت الإعدادات القديمة لكن تعذّرت هجرتها: %s", exc)
+        return False
+    _repair_committed_backup(path, data, txid)
+    return True
+
+
+def read_settings_resilient(path):
+    """قراءة fail-closed: لا تستعيد إلا backup معلّمة committed صراحةً."""
+    primary_exists = os.path.exists(path)
+    if primary_exists:
+        primary, error = _read_dict(path)
+        if error is None:
+            # أي primary سليمة هي المرجع دائماً؛ ولا يصل حقل المعاملة إلى المستهلكين.
+            data = _settings_data(primary)
+            txid = primary.get(_PRIMARY_TXID)
+            if _valid_txid(txid):
+                # لا تكفي مساواة البيانات: يجب أن تنتمي backup لنفس المعاملة.
+                _repair_committed_backup(path, data, txid)
+            else:
+                _migrate_legacy_primary(path, data)
+            return data, None
+        log.error("ملف الإعدادات %s تالف (%s)", path, type(error).__name__)
+        _quarantine_corrupt(path)
+
+    backup = path + ".bak"
+    if not os.path.exists(backup):
+        return (None, "corrupt") if primary_exists else (None, None)
+    envelope, backup_error = _read_dict(backup)
+    decoded = None if backup_error is not None else _decode_committed_backup(envelope)
+    if decoded is None:
+        # PREPARED قد تكون عملية فشلت قبل commit؛ والنسخة القديمة بلا marker قد
+        # تحتوي صلاحيات/أسراراً أُلغيَت، لذلك لا نطبق أياً منهما تلقائياً.
+        log.error("رُفضت نسخة إعدادات احتياطية غير committed")
+        return None, "corrupt"
+    txid, recovered = decoded
+    try:
+        atomic_write_json(path, _primary_document(recovered, txid), mode=0o600)
+    except OSError as exc:
+        log.error("استُعيدت الإعدادات لكن تعذّر إصلاح الملف الأساسي: %s", exc)
+    else:
+        log.warning("استُعيدت الإعدادات من نسخة committed وأُصلح الملف الأساسي")
+    return recovered, "recovered"
+
 
 def _env_int(name):
     v = os.environ.get(name)
@@ -62,7 +197,7 @@ class Settings:
         self.load()
 
     def load(self):
-        data, status = read_json_resilient(self.path)
+        data, status = read_settings_resilient(self.path)
         self.recovery = status
         if data:
             self.data.update(data)
@@ -77,19 +212,24 @@ class Settings:
         self.data["bot_token"] = self.data.get("bot_token") or os.environ.get("BOT_TOKEN")
 
     def _commit(self, data):
-        """يكتب نسخة مرشّحة أولاً، ثم يبدّل الحالة في الذاكرة بعد النجاح."""
+        """معاملة: PREPARED ثم primary كنقطة commit ثم COMMITTED بأفضل جهد."""
         with self._lock:
-            candidate = copy.deepcopy(data)
-            # نحتفظ بآخر نسخة سليمة قبل الاستبدال — تُستخدم للاسترجاع لو تلف الملف
-            if os.path.exists(self.path):
-                try:
-                    shutil.copy2(self.path, self.path + ".bak")
-                    os.chmod(self.path + ".bak", 0o600)
-                except OSError:
-                    pass
-            # الملف يحتوي أسرارًا (توكن فيسبوك/كلمات مرور X) — قراءة المالك فقط
-            atomic_write_json(self.path, candidate, mode=0o600)
+            candidate = _settings_data(data)
+            txid = secrets.token_hex(16)
+            prepared = _backup_envelope(candidate, _BACKUP_PREPARED, txid)
+            committed = _backup_envelope(candidate, _BACKUP_COMMITTED, txid)
+            primary = _primary_document(candidate, txid)
+            # إذا فشلت هذه أو كتابة primary لا تتغير الذاكرة، وPREPARED لا تُستعاد.
+            atomic_write_json(self.path + ".bak", prepared, mode=0o600)
+            atomic_write_json(self.path, primary, mode=0o600)
+            # primary أصبح commit point؛ لا نُرجع فشلاً بعد هذه النقطة.
             self.data = candidate
+            try:
+                atomic_write_json(self.path + ".bak", committed, mode=0o600)
+            except OSError as exc:
+                log.warning(
+                    "حُفظت الإعدادات لكن تعذّر إنهاء النسخة الاحتياطية: %s", exc
+                )
 
     def save(self):
         """يحفظ تعديلات مباشرة متعمّدة (يستخدمه configure.py)."""

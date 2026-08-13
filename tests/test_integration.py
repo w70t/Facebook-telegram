@@ -519,7 +519,12 @@ def test_ambiguous_forbidden_keeps_session_for_later_retry(app, monkeypatch, tmp
         pass
     try:
         app.xreader.active = "acct"
-        assert app.xreader.report_failure(Exception("403 Forbidden")) is False
+        app.xreader.client = object()
+        app.xreader.ready = True
+        session = app.xreader.capture_session()
+        assert app.xreader.report_failure(
+            Exception("403 Forbidden"), session=session
+        ) is False
         assert os.path.exists(cookie_file), "403 غامض حذف جلسة صالحة محتملة"
     finally:
         app.xreader.active = None
@@ -530,7 +535,12 @@ def test_ambiguous_forbidden_keeps_session_for_later_retry(app, monkeypatch, tmp
 def test_network_error_does_not_burn_account(app):
     app.xreader.active = "acct"
     try:
-        assert app.xreader.report_failure(Exception("bandwidth limit exceeded")) is False
+        app.xreader.client = object()
+        app.xreader.ready = True
+        session = app.xreader.capture_session()
+        assert app.xreader.report_failure(
+            Exception("bandwidth limit exceeded"), session=session
+        ) is False
         assert app.xreader.active == "acct"
     finally:
         app.xreader.active = None

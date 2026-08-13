@@ -16,6 +16,8 @@ sources.json
 x_cookies*.json
 # ملفات الكتابة الذرية قد تبقى بعد SIGKILL/انقطاع الكهرباء وتحوي جلسة كاملة.
 .x-cookies-*.tmp
+# atomic_write_json قد يترك هذا الملف بعد SIGKILL/انقطاع الكهرباء وفيه أسرار.
+.tmp-*.json
 
 downloads/
 __pycache__/
