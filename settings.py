@@ -11,6 +11,7 @@ import os
 import secrets
 import threading
 import time
+import unicodedata
 
 from jsonio import atomic_write_json, read_json
 
@@ -38,6 +39,8 @@ DEFAULTS = {
     "sources": [],               # قنوات تلغرام: [{"id","title","input"}]
     "download_dir": "downloads",
     "filter_words": [],          # كلمات ممنوعة: أي منشور يحتويها يُتجاهل
+    # عبارات حرفية تُحذف من النص قبل عرضه/نشره؛ لا تُفسر كتعبيرات منتظمة.
+    "text_cleanup_phrases": [],
     # حدود التشغيل — تحمي بطاقة الـ SD من الامتلاء
     "max_media_mb": 200,         # أقصى حجم وسيط يُنزَّل
     "pending_ttl_hours": 48,     # عمر المنشور المعلّق قبل حذفه تلقائياً
@@ -65,6 +68,75 @@ _MAX_UNIX_TIMESTAMP = 253402300799  # 9999-12-31T23:59:59Z
 _MAX_X_LOGIN_COOLDOWN_SECONDS = 24 * 60 * 60
 _MAX_X_LOGIN_COOLDOWNS = 32
 _X_LOGIN_SCOPE_HEX_LENGTH = 64
+_MAX_CLEANUP_PHRASES = 100
+_MAX_CLEANUP_PHRASE_LENGTH = 200
+
+_ARABIC_ALEF_VARIANTS = str.maketrans({
+    "آ": "ا",
+    "أ": "ا",
+    "إ": "ا",
+    "ٱ": "ا",
+    "ٲ": "ا",
+    "ٳ": "ا",
+    "ٵ": "ا",
+})
+
+
+def _is_arabic_codepoint(char):
+    codepoint = ord(char)
+    return (
+        0x0600 <= codepoint <= 0x06FF
+        or 0x0750 <= codepoint <= 0x077F
+        or 0x08A0 <= codepoint <= 0x08FF
+        or 0xFB50 <= codepoint <= 0xFDFF
+        or 0xFE70 <= codepoint <= 0xFEFF
+    )
+
+
+def _filter_match_key(value):
+    """يطبع المقارنة فقط، مع إبقاء النص المحفوظ كما أدخله المستخدم."""
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = normalized.translate(_ARABIC_ALEF_VARIANTS).replace("ـ", "")
+    return "".join(
+        char
+        for char in normalized
+        if not (
+            unicodedata.category(char).startswith("C")
+            or (
+                _is_arabic_codepoint(char)
+                and unicodedata.category(char) in {"Mn", "Me"}
+            )
+        )
+    )
+
+
+def _normalize_cleanup_phrase(value):
+    """يطبع عبارة حذف حرفية، ويرفض المحارف الخفية أو متعددة الأسطر."""
+    if not isinstance(value, str):
+        raise ValueError("cleanup phrase must be text")
+    if any(
+        char in "\r\n"
+        or unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in value
+    ):
+        raise ValueError("cleanup phrase contains control or newline characters")
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in normalized
+    ):
+        raise ValueError("cleanup phrase contains control or newline characters")
+    # بعد رفض المحارف التحكمية، لا يبقى من whitespace إلا فواصل آمنة مرئية.
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        raise ValueError("cleanup phrase must not be empty")
+    if len(normalized) > _MAX_CLEANUP_PHRASE_LENGTH:
+        raise ValueError("cleanup phrase is too long")
+    return normalized
 
 
 def _valid_txid(value):
@@ -347,7 +419,11 @@ class Settings:
     def add_filter_word(self, word):
         with self._lock:
             word = word.strip()
-            if not word or word.lower() in [w.lower() for w in self.filter_words()]:
+            identity = _filter_match_key(word)
+            if not identity or identity in {
+                _filter_match_key(existing)
+                for existing in self.filter_words()
+            }:
                 return False
             words = self.filter_words()
             words.append(word)
@@ -357,14 +433,62 @@ class Settings:
     def remove_filter_word(self, word):
         with self._lock:
             words = self.filter_words()
-            kept = [w for w in words if w.lower() != word.strip().lower()]
+            identity = _filter_match_key(word.strip())
+            kept = [w for w in words if _filter_match_key(w) != identity]
             removed = len(words) - len(kept)
             self._replace("filter_words", kept)
             return removed
 
     def is_filtered(self, text):
-        low = (text or "").lower()
-        return any(w.lower() in low for w in self.filter_words())
+        normalized = _filter_match_key(text or "")
+        return any(
+            identity and identity in normalized
+            for identity in map(_filter_match_key, self.filter_words())
+        )
+
+    # --- حذف عبارات حرفية من النص ---
+    def cleanup_phrases(self):
+        raw_phrases = self.data.get("text_cleanup_phrases")
+        if not isinstance(raw_phrases, list):
+            return []
+        phrases = []
+        identities = set()
+        for raw_phrase in raw_phrases:
+            try:
+                phrase = _normalize_cleanup_phrase(raw_phrase)
+            except ValueError:
+                continue
+            identity = phrase.casefold()
+            if identity in identities:
+                continue
+            identities.add(identity)
+            phrases.append(phrase)
+            if len(phrases) == _MAX_CLEANUP_PHRASES:
+                break
+        return phrases
+
+    def add_cleanup_phrase(self, phrase):
+        with self._lock:
+            phrase = _normalize_cleanup_phrase(phrase)
+            phrases = self.cleanup_phrases()
+            identity = phrase.casefold()
+            if identity in {existing.casefold() for existing in phrases}:
+                return False
+            if len(phrases) >= _MAX_CLEANUP_PHRASES:
+                raise ValueError("too many cleanup phrases")
+            phrases.append(phrase)
+            self._replace("text_cleanup_phrases", phrases)
+            return True
+
+    def remove_cleanup_phrase(self, phrase):
+        with self._lock:
+            identity = _normalize_cleanup_phrase(phrase).casefold()
+            phrases = self.cleanup_phrases()
+            kept = [item for item in phrases if item.casefold() != identity]
+            removed = len(phrases) - len(kept)
+            if removed:
+                self._replace("text_cleanup_phrases", kept)
+            return removed
 
     # --- فيسبوك ---
     def facebook_ready(self):

@@ -183,6 +183,93 @@ def test_filter_words_are_case_insensitive(settings):
     assert settings.remove_filter_word("SALE") == 1
 
 
+def test_filter_words_normalize_arabic_alef_diacritics_and_tatweel(settings):
+    assert settings.add_filter_word("إعلان") is True
+    assert settings.is_filtered("هذا إِعْــلَان مدفوع") is True
+    assert settings.is_filtered("إع\u200cلان مدفوع") is True
+    assert settings.is_filtered("إع\u200fلان مدفوع") is True
+    assert settings.add_filter_word("اعلان") is False
+    assert settings.remove_filter_word("إعـلان") == 1
+    assert settings.is_filtered("اعلان آخر") is False
+
+
+def test_cleanup_phrases_are_literal_normalized_and_persistent(tmp_path):
+    path = str(tmp_path / "settings.json")
+    settings = Settings(path=path)
+
+    assert settings.add_cleanup_phrase("  Million　Store  ") is True
+    assert settings.add_cleanup_phrase("million store") is False
+    assert settings.add_cleanup_phrase(".* [channel]") is True
+    assert settings.cleanup_phrases() == ["Million Store", ".* [channel]"]
+    assert Settings(path=path).cleanup_phrases() == [
+        "Million Store", ".* [channel]",
+    ]
+    assert settings.remove_cleanup_phrase("MILLION STORE") == 1
+    assert settings.remove_cleanup_phrase("MILLION STORE") == 0
+    assert settings.cleanup_phrases() == [".* [channel]"]
+
+
+@pytest.mark.parametrize("phrase", [
+    "",
+    "   ",
+    "سطر\nثانٍ",
+    "سطر\rثانٍ",
+    "مخفي\u200bهنا",
+    "tab\there",
+    "x" * 201,
+])
+def test_cleanup_phrase_rejects_empty_hidden_multiline_or_oversized_input(
+    settings, phrase,
+):
+    before = copy.deepcopy(settings.data)
+    with pytest.raises(ValueError):
+        settings.add_cleanup_phrase(phrase)
+    assert settings.data == before
+
+
+def test_cleanup_phrases_are_bounded_and_failed_add_is_atomic(settings):
+    for number in range(100):
+        assert settings.add_cleanup_phrase(f"phrase-{number}") is True
+    before = copy.deepcopy(settings.data)
+    primary_before = read_document(settings.path)
+    backup_before = read_document(settings.path + ".bak")
+
+    with pytest.raises(ValueError, match="too many"):
+        settings.add_cleanup_phrase("one-too-many")
+
+    assert settings.data == before
+    assert read_document(settings.path) == primary_before
+    assert read_document(settings.path + ".bak") == backup_before
+
+
+def test_cleanup_phrase_write_failure_does_not_mutate_memory(
+    settings, monkeypatch,
+):
+    settings.add_cleanup_phrase("رابط القناة")
+    before = copy.deepcopy(settings.data)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(settings_module, "atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="disk unavailable"):
+        settings.add_cleanup_phrase("إعلان")
+    assert settings.data == before
+    with pytest.raises(OSError, match="disk unavailable"):
+        settings.remove_cleanup_phrase("رابط القناة")
+    assert settings.data == before
+
+
+def test_cleanup_phrases_sanitize_corrupt_storage_and_return_a_copy(settings):
+    settings.data["text_cleanup_phrases"] = [
+        "  صالح  ", "صالح", "مخفي\u200b", None, "ثانٍ",
+    ]
+    phrases = settings.cleanup_phrases()
+    assert phrases == ["صالح", "ثانٍ"]
+    phrases.append("خارجي")
+    assert settings.cleanup_phrases() == ["صالح", "ثانٍ"]
+
+
 def test_x_login_rotation(settings):
     settings.add_x_login("first", None, "pw1")
     settings.add_x_login("second", None, "pw2")

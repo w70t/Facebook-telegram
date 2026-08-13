@@ -3034,3 +3034,385 @@ def test_completed_secret_deletion_failure_persists_until_restart(app):
 
     asyncio.run(scenario())
     assert app._x_secret_delete_unconfirmed is True
+
+
+# ============ تنظيف محتوى Telegram ومنع الإعلانات ============
+class _SourceMessage:
+    def __init__(self, text, *, media=None, entities=None, grouped_id=None):
+        self.message = text
+        self.media = media
+        self.entities = list(entities or ())
+        self.grouped_id = grouped_id
+        self.downloads = 0
+
+    async def download_media(self, file):
+        self.downloads += 1
+        raise AssertionError("يجب تطبيق المنع قبل تنزيل الوسائط")
+
+
+class _SourceEvent:
+    def __init__(self, message=None, *, messages=None, chat_id=-100123):
+        self.chat_id = chat_id
+        self.message = message
+        self.messages = list(messages or ())
+
+
+def _utf16_entity(app, text, anchor, url):
+    start = text.index(anchor)
+    offset = len(app.helpers.add_surrogate(text[:start]))
+    length = len(app.helpers.add_surrogate(anchor))
+    return app.types.MessageEntityTextUrl(offset=offset, length=length, url=url)
+
+
+def test_source_filter_blocks_before_media_download(app, monkeypatch):
+    app.source_ids = {-100123}
+    app.S.add_filter_word("إعلان")
+    app.S.add_cleanup_phrase("إعلان")
+    message = _SourceMessage("هذا إِعْــلَان مدفوع", media=object())
+
+    async def forbidden_queue(*_args, **_kwargs):
+        raise AssertionError("المنشور الممنوع لا يصل إلى قائمة المراجعة")
+
+    async def forbidden_download(*_args, **_kwargs):
+        raise AssertionError("المنشور الممنوع لا ينزّل وسائطه")
+
+    monkeypatch.setattr(app, "_queue_for_review", forbidden_queue)
+    monkeypatch.setattr(app, "_download_tg_media", forbidden_download)
+
+    asyncio.run(app.on_source_message(_SourceEvent(message)))
+
+    assert message.downloads == 0
+
+
+def test_source_filter_checks_hidden_text_url_before_download(app, monkeypatch):
+    app.source_ids = {-100123}
+    app.S.add_filter_word("MillionStore")
+    text = "😀 اضغط هنا لمشاهدة الخبر"
+    entity = _utf16_entity(
+        app, text, "اضغط هنا", "https://t.me/MillionStore/42",
+    )
+    message = _SourceMessage(text, media=object(), entities=[entity])
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("وجهة الرابط الممنوعة يجب كشفها قبل التنزيل")
+
+    monkeypatch.setattr(app, "_download_tg_media", forbidden)
+    monkeypatch.setattr(app, "_queue_for_review", forbidden)
+
+    asyncio.run(app.on_source_message(_SourceEvent(message)))
+
+
+def test_source_filter_checks_webpage_preview_url_before_download(app, monkeypatch):
+    app.source_ids = {-100123}
+    app.S.add_filter_word("MillionStore")
+    webpage = types.SimpleNamespace(url="https://t.me/MillionStore")
+    media = types.SimpleNamespace(webpage=webpage)
+    message = _SourceMessage("شاهد التفاصيل", media=media)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("رابط المعاينة الممنوع يجب كشفه قبل التنزيل")
+
+    monkeypatch.setattr(app, "_download_tg_media", forbidden)
+    monkeypatch.setattr(app, "_queue_for_review", forbidden)
+
+    asyncio.run(app.on_source_message(_SourceEvent(message)))
+
+
+def test_hidden_telegram_text_url_uses_utf16_offsets_after_emoji(app):
+    text = "😀 بداية اضغط هنا نهاية"
+    anchor = "اضغط هنا"
+    message = _SourceMessage(
+        text,
+        entities=[_utf16_entity(app, text, anchor, "https://t.me/channel")],
+    )
+
+    spans = app._telegram_hidden_link_spans(message)
+
+    assert spans == [(text.index(anchor), text.index(anchor) + len(anchor))]
+    assert app.clean_source_text(text, hidden_link_spans=spans) == "😀 بداية نهاية"
+
+
+def test_malformed_utf16_entity_inside_emoji_is_ignored_without_exception(app):
+    # offset=1 يقع بين زوجي surrogate للرمز 😀، ولا يجوز أن يُسقط المعالج.
+    malformed = app.types.MessageEntityTextUrl(
+        offset=1, length=1, url="https://t.me/channel",
+    )
+    message = _SourceMessage("😀 خبر", entities=[malformed])
+
+    assert app._telegram_hidden_link_spans(message) == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://t.me:not-a-port/channel",
+    "https://user@t.me/channel",
+    "https://not.t.me/channel",
+    "https://t.me.evil.example/channel",
+])
+def test_telegram_entity_url_validation_fails_closed_without_raising(app, url):
+    assert app._is_telegram_url(url) is False
+
+
+def test_album_filter_scans_second_caption_before_any_download(app, monkeypatch):
+    app.source_ids = {-100123}
+    app.S.add_filter_word("إعلان")
+    first = _SourceMessage("خبر عادي", media=object())
+    second = _SourceMessage("إعلان في الجزء الثاني", media=object())
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("الألبوم الممنوع لا ينزّل أي عنصر")
+
+    monkeypatch.setattr(app, "_download_tg_media", forbidden)
+    monkeypatch.setattr(app, "_queue_for_review", forbidden)
+
+    asyncio.run(app.on_source_album(_SourceEvent(messages=[first, second])))
+
+
+def test_source_ingress_cleans_link_and_configured_phrase(app, monkeypatch):
+    app.source_ids = {-100123}
+    app.S.add_cleanup_phrase("Million Store")
+    captured = []
+
+    async def capture(text, media, origin="", on_persisted=None):
+        captured.append((text, media, origin))
+        return "queued"
+
+    monkeypatch.setattr(app, "_queue_for_review", capture)
+    message = _SourceMessage(
+        "خبر Million Store مهم https://t.me/MillionStore_1 تابعونا"
+    )
+
+    asyncio.run(app.on_source_message(_SourceEvent(message)))
+
+    assert captured == [("خبر مهم تابعونا", [], "")]
+
+
+def test_link_only_source_without_publishable_media_is_not_queued(app, monkeypatch):
+    app.source_ids = {-100123}
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("لا يجب إنشاء منشور فارغ للمراجعة")
+
+    monkeypatch.setattr(app, "_queue_for_review", forbidden)
+    asyncio.run(app.on_source_message(_SourceEvent(
+        _SourceMessage("https://t.me/only_link")
+    )))
+
+
+def test_review_buttons_include_manual_clean_action(app):
+    item_id = app.PENDING.add("خبر https://t.me/channel")
+    item = app.PENDING.get(item_id)
+
+    callback_data = [
+        button.data
+        for row in app._build_buttons(item_id, item)
+        for button in row
+    ]
+
+    assert f"clean:{item_id}".encode() in callback_data
+    builder = next(
+        builder
+        for builder, handler in app.bot.handlers
+        if handler is app.on_post_action
+    )
+    assert re.match(builder.kwargs["pattern"], f"clean:{item_id}".encode())
+
+
+def test_manual_clean_updates_pending_and_refreshes_same_review(app, monkeypatch):
+    app.S.add_cleanup_phrase("اسم القناة")
+    item_id = app.PENDING.add("خبر اسم القناة https://t.me/channel مهم")
+    app.PENDING.update(
+        item_id, review={"chat": -100999, "msg": 77, "has_media": False},
+    )
+    refreshes = []
+
+    async def fake_send(current_id, refresh=False):
+        refreshes.append((current_id, refresh))
+
+    monkeypatch.setattr(app, "_send_for_review", fake_send)
+    event = Event(data=f"clean:{item_id}".encode())
+
+    asyncio.run(app.on_post_action(event))
+
+    assert app.PENDING.get(item_id)["text"] == "خبر مهم"
+    assert refreshes == [(item_id, True)]
+
+
+def test_manual_clean_is_blocked_while_publish_is_in_progress(app, monkeypatch):
+    item_id = app.PENDING.add("خبر https://t.me/channel")
+    app._publishing.add(item_id)
+
+    def forbidden_update(*_args, **_kwargs):
+        raise AssertionError("لا يجوز تعديل النص أثناء النشر")
+
+    monkeypatch.setattr(app.PENDING, "update", forbidden_update)
+    event = Event(data=f"clean:{item_id}".encode())
+
+    asyncio.run(app.on_post_action(event))
+
+    assert app.PENDING.get(item_id)["text"] == "خبر https://t.me/channel"
+    assert any("قيد النشر" in (text or "") for text, _ in event.answers)
+
+
+def test_edit_rejects_blocked_text_and_keeps_retry_state(app, monkeypatch):
+    app.S.add_filter_word("إعلان")
+    item_id = app.PENDING.add("النص الأصلي")
+    app._set_state(42, {"action": "edit_text", "item_id": item_id})
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("النص الممنوع لا يحدّث رسالة المراجعة")
+
+    monkeypatch.setattr(app, "_send_for_review", forbidden)
+    asyncio.run(app._apply_edit(
+        Event(text="إعلان مدفوع"),
+        {"action": "edit_text", "item_id": item_id},
+    ))
+
+    assert app.PENDING.get(item_id)["text"] == "النص الأصلي"
+    state = app._get_state(42)
+    assert state["action"] == "edit_text"
+    assert state["item_id"] == item_id
+
+
+def test_edit_cleans_links_and_phrases_before_refresh(app, monkeypatch):
+    app.S.add_cleanup_phrase("اسم القناة")
+    item_id = app.PENDING.add("النص الأصلي")
+    app._set_state(42, {"action": "edit_text", "item_id": item_id})
+    refreshes = []
+
+    async def fake_send(current_id, refresh=False):
+        refreshes.append((current_id, refresh))
+
+    monkeypatch.setattr(app, "_send_for_review", fake_send)
+    asyncio.run(app._apply_edit(
+        Event(text="خبر اسم القناة https://t.me/channel مفيد"),
+        {"action": "edit_text", "item_id": item_id},
+    ))
+
+    assert app.PENDING.get(item_id)["text"] == "خبر مفيد"
+    assert app._get_state(42) is None
+    assert refreshes == [(item_id, True)]
+
+
+def test_publish_rechecks_new_block_word_before_facebook_call(app, monkeypatch):
+    item_id = app.PENDING.add("إعلان أُضيفت كلمته بعد وصول المنشور")
+    app.S.add_filter_word("إعلان")
+
+    class ForbiddenPublisher:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("لا يجب الاتصال بفيسبوك لمنشور ممنوع")
+
+    monkeypatch.setattr(app, "FacebookPublisher", ForbiddenPublisher)
+    event = Event()
+
+    asyncio.run(app._publish(event, item_id, include_media=False))
+
+    assert app.PENDING.get(item_id) is not None
+    assert any("مُنع" in (text or "") for text, _ in event.answers)
+
+
+def test_review_send_and_refresh_disable_link_previews(app, monkeypatch):
+    item_id = app.PENDING.add("رابط خارجي https://example.com/article")
+    sends = []
+    edits = []
+
+    async def send_message(*args, **kwargs):
+        sends.append((args, kwargs))
+        return types.SimpleNamespace(id=707)
+
+    async def edit_message(*args, **kwargs):
+        edits.append((args, kwargs))
+        return types.SimpleNamespace(id=707)
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+    monkeypatch.setattr(app.bot, "edit_message", edit_message, raising=False)
+
+    asyncio.run(app._send_for_review(item_id))
+    asyncio.run(app._send_for_review(item_id, refresh=True))
+
+    assert sends[0][1]["link_preview"] is False
+    assert edits[0][1]["link_preview"] is False
+
+
+def test_startup_sanitizer_updates_old_pending_and_refreshes_review(app, monkeypatch):
+    item_id = app.PENDING.add("خبر https://t.me/old_channel مهم")
+    app.PENDING.update(
+        item_id, review={"chat": -100999, "msg": 77, "has_media": False},
+    )
+    refreshed = []
+
+    async def fake_send(current_id, refresh=False):
+        refreshed.append((current_id, refresh, app.PENDING.get(current_id)["text"]))
+
+    monkeypatch.setattr(app, "_send_for_review", fake_send)
+
+    assert asyncio.run(app._sanitize_pending_reviews()) == 1
+    assert app.PENDING.get(item_id)["text"] == "خبر مهم"
+    assert refreshed == [(item_id, True, "خبر مهم")]
+
+
+def test_startup_sanitizer_never_changes_publishing_record(app, monkeypatch):
+    item_id = app.PENDING.add("خبر https://t.me/channel")
+    app.PENDING.update(item_id, publish_state="publishing")
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("لا يجوز تعديل سجل نشر غير محسوم")
+
+    monkeypatch.setattr(app, "_send_for_review", forbidden)
+
+    assert asyncio.run(app._sanitize_pending_reviews()) == 0
+    assert app.PENDING.get(item_id)["text"] == "خبر https://t.me/channel"
+
+
+def test_automatic_telegram_cleanup_does_not_rewrite_legacy_x_pending(app):
+    item_id = app.PENDING.add(
+        "نص قديم https://t.me/reference",
+        origin="https://x.com/source/status/123",
+    )
+
+    assert asyncio.run(app._sanitize_pending_reviews()) == 0
+    assert app.PENDING.get(item_id)["text"] == "نص قديم https://t.me/reference"
+
+
+def test_filter_menu_exposes_separate_block_and_cleanup_controls(app):
+    event = Event()
+
+    asyncio.run(app._show_filter(event))
+
+    data = {
+        button.data
+        for row in event.response_buttons[-1]
+        for button in row
+    }
+    assert {b"flt:add", b"flt:del", b"flt:clean_add", b"flt:clean_del"} <= data
+    assert "روابط قنوات Telegram تُحذف تلقائياً" in event.responses[-1]
+
+
+def test_filter_menu_never_exceeds_telegram_text_limit(app, monkeypatch):
+    monkeypatch.setattr(
+        app.S, "cleanup_phrases", lambda: ["ع" * 200 for _ in range(100)],
+    )
+    event = Event()
+
+    asyncio.run(app._show_filter(event))
+
+    assert len(event.responses[-1]) <= app.TEXT_LIMIT
+
+
+def test_cleanup_phrase_callback_adds_phrase_and_sanitizes_pending(app, monkeypatch):
+    callback = Event(data=b"flt:clean_add")
+    asyncio.run(app.on_flt(callback))
+    assert app._get_state(42)["action"] == "add_cleanup_phrase"
+
+    calls = []
+
+    async def fake_sanitize():
+        calls.append(True)
+        return 2
+
+    monkeypatch.setattr(app, "_sanitize_pending_reviews", fake_sanitize)
+    message = Event(text="اسم القناة")
+    asyncio.run(app.on_text(message))
+
+    assert app.S.cleanup_phrases() == ["اسم القناة"]
+    assert calls == [True]
+    assert "منشور معلّق" in message.responses[-1]
