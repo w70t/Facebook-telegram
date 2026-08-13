@@ -46,6 +46,7 @@ from xbrowser import (
     XBrowserPageChanged,
     XBrowserRateLimited,
     XBrowserSessionError,
+    XBrowserTransientError,
     XBrowserUnavailable,
     XBrowserUnsupportedChallenge,
 )
@@ -225,6 +226,9 @@ _X_COOLDOWN_KEY_CONTEXT = b"tg2fb/x-cooldown/v1\0"
 _X_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 _XLOGIN_SAFE_STAGES = {
     "login_started",
+    "page_ready",
+    "username_submitted",
+    "password_submitted",
     "challenge_requested_alternate_identifier",
     "challenge_requested_two_factor",
     "challenge_requested_verification_code",
@@ -233,6 +237,12 @@ _XLOGIN_SAFE_STAGES = {
     "challenge_received_verification_code",
     "session_verified",
     "rate_limited",
+    "rate_limited_before_page_ready",
+    "rate_limited_after_page_ready",
+    "rate_limited_after_username",
+    "rate_limited_after_password",
+    "rate_limited_after_challenge_requested",
+    "transient_retry",
     "attempt_finished",
 }
 
@@ -3422,8 +3432,23 @@ async def _save_x_login(event, st, password):
     })
     credentials = {"username": username, "email": email, "password": password}
     password = None
+    browser_progress = "before_page_ready"
+
+    async def progress_handler(stage):
+        """Record fixed milestones without pausing the browser for Telegram RPC."""
+        nonlocal browser_progress
+        progress_states = {
+            "page_ready": "after_page_ready",
+            "username_submitted": "after_username",
+            "password_submitted": "after_password",
+        }
+        if stage not in progress_states:
+            return
+        browser_progress = progress_states[stage]
+        _log_xlogin_stage(stage)
 
     async def challenge_handler(kind, prompt=""):
+        nonlocal browser_progress
         _require_x_admin(uid)
         safe_kind = {
             "alternate_identifier": "alternate_identifier",
@@ -3431,6 +3456,7 @@ async def _save_x_login(event, st, password):
             "verification": "verification_code",
         }.get(kind)
         if safe_kind:
+            browser_progress = "after_challenge_requested"
             _log_xlogin_stage(f"challenge_requested_{safe_kind}")
         response = await _wait_for_x_challenge(
             event, kind, prompt, setup_id=setup_id,
@@ -3487,7 +3513,11 @@ async def _save_x_login(event, st, password):
         if not xreader.is_generation_current(login_generation):
             await event.respond("🛑 أُلغيت محاولة X لأن جلسة أحدث فُعّلت.")
             return
-        ok = await xreader.login_interactive(credentials, challenge_handler)
+        ok = await xreader.login_interactive(
+            credentials,
+            challenge_handler,
+            progress_handler=progress_handler,
+        )
         if not ok:
             await event.respond("❌ تعذّر تسجيل الدخول إلى X. تحقق من البيانات.")
             return
@@ -3550,7 +3580,39 @@ async def _save_x_login(event, st, password):
         # لا نُبقي كلمة المرور في ذاكرة مهمة العداد أو أثناء RPC Telegram.
         credentials.clear()
         _log_xlogin_stage("rate_limited")
+        rate_stage = (
+            browser_progress
+            if browser_progress in {
+                "before_page_ready", "after_page_ready", "after_username",
+                "after_password", "after_challenge_requested",
+            }
+            else "before_page_ready"
+        )
+        _log_xlogin_stage(f"rate_limited_{rate_stage}")
+        stage_text = {
+            "before_page_ready": "قبل أن تصبح صفحة الدخول جاهزة",
+            "after_page_ready": "بعد فتح صفحة الدخول وقبل إرسال اسم المستخدم",
+            "after_username": "بعد إرسال اسم المستخدم وقبل إرسال كلمة المرور",
+            "after_password": "بعد إرسال كلمة المرور وقبل ظهور طلب رمز التحقق",
+            "after_challenge_requested": "بعد أن طلب X معلومة تحقق إضافية",
+        }[rate_stage]
+        try:
+            await event.respond(
+                f"🔎 التشخيص الآمن: أظهر X التقييد {stage_text}."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر إرسال موضع تقييد X (%s)", type(exc).__name__)
         await _activate_x_account_cooldown(event, scope)
+    except XBrowserTransientError:
+        # A generic "try again later" is not proof of an hour-long X limit.
+        # Keep it out of the cooldown store and let the user retry manually.
+        credentials.clear()
+        _log_xlogin_stage("transient_retry")
+        await event.respond(
+            "⚠️ عرض X خطأً مؤقتاً عاماً («حاول لاحقاً»)، لكنه لم يعرض رسالة "
+            "تقييد محاولات صريحة؛ لذلك لم أبدأ عداد ساعة. أُغلقت المحاولة "
+            "ولم تُحفظ جلسة جديدة."
+        )
     except XBrowserUnavailable:
         await event.respond(
             "❌ متصفح تسجيل X غير متوفر أو تعذّر الوصول إلى صفحة X الآن. "

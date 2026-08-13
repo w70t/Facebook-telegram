@@ -362,6 +362,33 @@ def test_interactive_login_uses_challenge_callback_then_verifies_and_saves(
         assert stat.S_IMODE(cookie.stat().st_mode) == 0o600
 
 
+def test_interactive_login_forwards_progress_callback(monkeypatch, tmp_path):
+    client = FakeClient()
+    reader, settings = _reader(monkeypatch, tmp_path, client)
+    received = {}
+    cred = settings.credentials[0]
+
+    async def obtain_cookies(credentials, challenge_handler, **kwargs):
+        # The caller mapping and XReader's password local are already cleared
+        # before a browser progress callback can await Telegram.
+        assert cred == {}
+        assert credentials["password"] == "top-secret"
+        assert callable(challenge_handler)
+        received.update(kwargs)
+        return {"auth_token": "auth", "ct0": "csrf"}
+
+    async def progress(_stage):
+        return None
+
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
+    assert asyncio.run(reader.login_interactive(
+        cred, lambda value: value,
+        progress_handler=progress,
+    )) is True
+    assert cred == {}
+    assert received == {"progress_handler": progress}
+
+
 def test_interactive_challenge_timeout_does_not_mark_failed_or_save_secret(
     monkeypatch, tmp_path, caplog,
 ):

@@ -461,7 +461,7 @@ class XReader:
             raise ValueError("اسم مستخدم X وكلمة المرور مطلوبان")
         return username, cred.get("email"), password
 
-    async def login_interactive(self, cred, challenge_handler):
+    async def login_interactive(self, cred, challenge_handler, progress_handler=None):
         """
         تسجيل صريح يتيح للواجهة طلب 2FA/challenges من المستخدم عبر callback.
 
@@ -471,24 +471,37 @@ class XReader:
         """
         if not callable(challenge_handler):
             raise TypeError("challenge_handler يجب أن يكون callable")
+        if progress_handler is not None and not callable(progress_handler):
+            raise TypeError("progress_handler يجب أن يكون callable")
         generation = self._session_generation
         username, auth_info_2, password = self._validate_credential(cred)
+        # The caller's short-lived mapping is no longer needed once its values
+        # have been copied into local variables. Clear it before any await so a
+        # Telegram progress callback can never keep an extra password copy alive.
+        cred.clear()
         client = self._new_client()
         browser_cookies = None
+        browser_credentials = {
+            "username": username,
+            "email": auth_info_2,
+            "password": password,
+        }
+        password = None
         try:
             from xbrowser import obtain_cookies
 
             await self._prepare_transaction(client)
             self._require_generation(generation)
-            browser_cookies = await obtain_cookies(
-                {
-                    "username": username,
-                    "email": auth_info_2,
-                    "password": password,
-                },
-                challenge_handler=challenge_handler,
+            progress_options = (
+                {"progress_handler": progress_handler}
+                if progress_handler is not None else {}
             )
-            password = None
+            browser_cookies = await obtain_cookies(
+                browser_credentials,
+                challenge_handler=challenge_handler,
+                **progress_options,
+            )
+            browser_credentials.clear()
             self._require_generation(generation)
             self._set_x_cookies(client, browser_cookies)
             browser_cookies.clear()
@@ -518,6 +531,7 @@ class XReader:
             raise
         finally:
             password = None
+            browser_credentials.clear()
             if browser_cookies is not None:
                 browser_cookies.clear()
 
