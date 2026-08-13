@@ -65,6 +65,15 @@ class XBrowserRateLimited(XBrowserError):
 class XBrowserPageChanged(XBrowserError):
     """X's login page no longer matches the reviewed state machine."""
 
+    SAFE_REASONS = {
+        "unspecified",
+        "initial_controls_timeout",
+    }
+
+    def __init__(self, message, *, reason="unspecified"):
+        super().__init__(message)
+        self.reason = reason if reason in self.SAFE_REASONS else "unspecified"
+
 
 class XBrowserCredentialsRejected(XBrowserError):
     """X explicitly rejected the supplied account credentials."""
@@ -381,6 +390,57 @@ async def _wait_for_stage(
             raise XBrowserUnsupportedChallenge("X requested an unrecognized login challenge")
         await page.wait_for_timeout(200)
     raise XBrowserPageChanged("X login did not reach a supported step")
+
+
+async def _wait_for_initial_login_stage(
+    page,
+    context,
+    *,
+    cancel_event=None,
+    timeout_ms=STEP_TIMEOUT_MS,
+):
+    """Wait through X's lazy JF remount before choosing a login form.
+
+    Immediately after ``domcontentloaded`` the current page briefly removes or
+    covers all inputs while React rebuilds the responsive forms.  Zero
+    actionable controls is therefore a loading state, not proof that the page
+    changed.  Multiple actionable controls remain an immediate fail-closed
+    ambiguity through ``_unique_actionable``.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while asyncio.get_running_loop().time() < deadline:
+        await _check_cancel(cancel_event)
+        _require_allowed_page(page)
+        cookies = await context.cookies(["https://x.com/"])
+        _require_allowed_page(page)
+        names = {item.get("name") for item in cookies if isinstance(item, dict)}
+        if {"auth_token", "ct0"}.issubset(names):
+            return "success", cookies
+        classification = _classify_text(await _body_text(page))
+        if classification == "unsupported":
+            raise XBrowserUnsupportedChallenge("X requested an unsupported challenge")
+        if classification == "rate_limited":
+            raise XBrowserRateLimited("X temporarily limited login attempts")
+        if classification == "credentials":
+            raise XBrowserCredentialsRejected("X rejected the account credentials")
+        username = await _unique_actionable(
+            page.locator(USERNAME_SELECTOR),
+            "X username field is ambiguous",
+        )
+        password = await _unique_actionable(
+            page.locator(PASSWORD_SELECTOR),
+            "X password field is ambiguous",
+        )
+        if username is not None:
+            return ("static" if password is not None else "username"), None
+        if password is not None:
+            return "password", None
+        await _dismiss_cookie_banner(page)
+        await page.wait_for_timeout(200)
+    raise XBrowserPageChanged(
+        "X initial login controls did not become ready",
+        reason="initial_controls_timeout",
+    )
 
 
 async def _capture_transition(page, field, selector):
@@ -738,14 +798,14 @@ async def _obtain_cookies(
 
         await _dismiss_cookie_banner(page)
 
-        # X currently serves two reviewed variants: the older multi-step flow,
-        # and a responsive full form with username and password visible together.
-        # Detect the latter before clicking anything; never guess a button when
-        # the password field is not actually present.
-        static_form = await _unique_actionable(
-            page.locator(PASSWORD_SELECTOR),
-            "X password field is ambiguous",
-        ) is not None
+        # X lazily remounts its responsive forms after domcontentloaded. Wait
+        # for one reviewed actionable initial stage before filling any value.
+        initial_stage, cookies = await _wait_for_initial_login_stage(
+            page, context, cancel_event=cancel_event,
+        )
+        static_form = initial_stage == "static"
+        if initial_stage == "success":
+            return playwright_to_twikit(cookies)
         if static_form:
             transition = await _fill_and_submit_static_form(page, username, password)
             username = None
@@ -754,7 +814,7 @@ async def _obtain_cookies(
                 page, context, cancel_event=cancel_event,
                 transition=transition,
             )
-        else:
+        elif initial_stage == "username":
             transition = await _fill_and_next(page, USERNAME_SELECTOR, username)
             username = None
             stage, cookies = await _wait_for_stage(
@@ -762,6 +822,9 @@ async def _obtain_cookies(
                 allow_password=True,
                 transition=transition,
             )
+        else:
+            username = None
+            stage, cookies = initial_stage, None
 
         challenge_attempts = 0
         password_submitted = static_form
