@@ -51,6 +51,10 @@ def app(tmp_path):
 
         import main as loaded_main
         main = loaded_main
+        # معظم هذا الملف يغطي كود X الخامل كاختبارات رجوع. الإنتاج يبقيه
+        # معطلاً، واختبارات التعطيل أدناه تعيد القيمة إلى False صراحةً.
+        assert main.X_INTEGRATION_ENABLED is False
+        main.X_INTEGRATION_ENABLED = True
         main.S.set("owner_id", 42)
         main.S.add_admin(42)
         main.S.set("review_chat_id", -100999)
@@ -182,6 +186,168 @@ def test_app_fixture_always_uses_stub_telethon(app):
     stub = sys.modules["stub_telethon"]
     assert app.TelegramClient is stub.TelegramClient
     assert sys.modules["telethon"].TelegramClient is stub.TelegramClient
+
+
+def test_x_disabled_removes_panel_buttons_and_reports_status(app, monkeypatch):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    data = [button.data for row in app._panel_markup() for button in row]
+    assert b"m:xlogins" not in data
+    assert b"m:xaccounts" not in data
+
+    event = Event()
+    asyncio.run(app._show_status(event))
+    assert "X: ⛔ متوقف بالكامل" in event.responses[-1]
+    assert "حسابات دخول X" not in event.responses[-1]
+
+
+@pytest.mark.parametrize(
+    ("handler", "data"),
+    (
+        ("on_menu", b"m:xlogins"),
+        ("on_menu", b"m:xaccounts"),
+        ("on_xlogin", b"xlog:add"),
+        ("on_xsetup", b"xsetup:old:skip_email"),
+        ("on_xacc", b"xacc:add"),
+    ),
+)
+def test_x_disabled_legacy_callbacks_do_not_start_state_or_reader(
+    app, monkeypatch, handler, data,
+):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy X callback reached the X reader")
+
+    for name in ("invalidate", "resolve", "latest_tweet_id"):
+        monkeypatch.setattr(app.xreader, name, forbidden)
+
+    event = Event(data=data)
+    asyncio.run(getattr(app, handler)(event))
+
+    assert app._get_state(event.sender_id) is None
+    assert event.answers == [(app.X_DISABLED_MESSAGE, True)]
+
+
+@pytest.mark.parametrize("action", (
+    "x_user", "x_email", "x_pass_pending", "x_pass", "x_login_running",
+    "x_auth_code", "x_switch", "x_login_del", "x_add", "x_del",
+))
+def test_x_disabled_stale_input_is_deleted_without_reader_or_browser(
+    app, monkeypatch, action,
+):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled X started browser login")
+
+    monkeypatch.setattr(app, "_save_x_login", forbidden)
+    app._set_state(42, {
+        "action": action,
+        "x_username": "reader",
+        "x_chat_id": 42,
+    })
+    event = Event(text="secret")
+
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is True
+    assert app._get_state(42) is None
+    assert event.responses == [app.X_DISABLED_MESSAGE]
+    assert (42, 42) not in app._x_secret_tombstones
+
+    ordinary = Event(text="ordinary message")
+    asyncio.run(app.on_text(ordinary))
+    assert ordinary.deleted is False
+
+
+def test_x_disabled_legacy_button_preserves_late_secret_tombstone(
+    app, monkeypatch,
+):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_chat_id": 42,
+    })
+
+    asyncio.run(app.on_xlogin(Event(data=b"xlog:add")))
+
+    assert app._get_state(42) is None
+    assert (42, 42) in app._x_secret_tombstones
+    late_secret = Event(text="late-secret")
+    asyncio.run(app.on_text(late_secret))
+    assert late_secret.deleted is True
+    assert (42, 42) not in app._x_secret_tombstones
+
+
+def test_x_disabled_warns_when_stale_secret_cannot_be_deleted(app, monkeypatch):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+    app._set_state(42, {
+        "action": "x_pass",
+        "x_username": "reader",
+        "x_chat_id": 42,
+    })
+    event = Event(text="secret", fail_delete=True)
+
+    asyncio.run(app.on_text(event))
+
+    assert event.deleted is False
+    assert "احذفها يدوياً فوراً" in event.responses[-1]
+    assert app._get_state(42) is None
+
+
+def test_x_disabled_old_outbox_does_not_recreate_x_settings(app, monkeypatch):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled X recreated its cursor")
+
+    monkeypatch.setattr(app.S, "set_x_last_id", forbidden)
+    app._checkpoint_x_origin({"origin": "https://x.com/source/status/123"})
+    assert "x_accounts" not in app.S.data
+
+
+def test_main_does_not_start_any_x_background_work(app, monkeypatch):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled X startup path was invoked")
+
+    monkeypatch.setattr(app, "_ensure_x_cooldown_scheduler", forbidden)
+    monkeypatch.setattr(app, "_ensure_x_account_cooldown_scheduler", forbidden)
+    monkeypatch.setattr(app, "x_poller", forbidden)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def bot_me(*_args, **_kwargs):
+        return types.SimpleNamespace(username="test_bot")
+
+    for client in (app.bot, app.user):
+        monkeypatch.setattr(client, "run_until_disconnected", noop, raising=False)
+    monkeypatch.setattr(app.bot, "start", noop, raising=False)
+    monkeypatch.setattr(app.bot, "get_me", bot_me, raising=False)
+    monkeypatch.setattr(app.user, "connect", noop, raising=False)
+    monkeypatch.setattr(app.user, "is_user_authorized", noop, raising=False)
+    monkeypatch.setattr(app, "housekeeping", noop)
+    monkeypatch.setattr(app, "_offer_command_keyboards", noop)
+
+    asyncio.run(app.main())
+
+
+def test_disabled_x_background_entrypoints_are_inert(app, monkeypatch):
+    monkeypatch.setattr(app, "X_INTEGRATION_ENABLED", False)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled X reader was contacted")
+
+    monkeypatch.setattr(app.xreader, "ensure_login", forbidden)
+    assert app._ensure_x_cooldown_scheduler({"generation": "old"}) is None
+    assert app._ensure_x_account_cooldown_scheduler(
+        "0" * 64, {"generation": "old"}
+    ) is None
+    assert asyncio.run(app.x_poller()) is None
 
 
 def test_x_rate_limit_starts_durable_one_hour_countdown(app, monkeypatch):

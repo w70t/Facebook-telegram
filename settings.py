@@ -37,29 +37,25 @@ DEFAULTS = {
     "user_phone": None,
     "sources": [],               # قنوات تلغرام: [{"id","title","input"}]
     "download_dir": "downloads",
-    # X (تويتر) — طريقة غير رسمية عبر twikit
-    "x_logins": [],              # جلسات الدخول: [{"username","email","password":null,"failed"}]
-    "x_accounts": [],            # الحسابات المتابَعة: [{"screen_name","user_id","last_id"}]
-    "x_poll_seconds": 120,
-    "x_skip_replies": True,      # X: انسخ التغريدات فقط لا الردود
-    "x_max_per_cycle": 5,        # سقف التغريدات لكل دورة (الباقي يأتي في الدورة التالية)
-    # حظر احترازي لمحاولات دخول X. لا يحتوي اسم مستخدم أو كلمة مرور؛ فقط موعد
-    # الانتهاء ومحادثة/رسالة Telegram التي تعرض العداد.
-    "x_login_cooldown": None,
-    # True only for the fail-closed storage-capacity fallback. A legacy timer
-    # from older releases has no such flag and must not block unrelated accounts.
-    "x_login_cooldown_emergency": False,
-    # Public integrity tag for the separate HMAC key; never the key itself.
-    "x_cooldown_key_id": None,
-    # Account-scoped cooldowns. Keys are opaque 64-hex fingerprints produced
-    # by the caller; raw X account identifiers and credentials never belong here.
-    # Keep x_login_cooldown above for rollback and legacy migration.
-    "x_login_cooldowns": {},
     "filter_words": [],          # كلمات ممنوعة: أي منشور يحتويها يُتجاهل
     # حدود التشغيل — تحمي بطاقة الـ SD من الامتلاء
     "max_media_mb": 200,         # أقصى حجم وسيط يُنزَّل
     "pending_ttl_hours": 48,     # عمر المنشور المعلّق قبل حذفه تلقائياً
 }
+
+# X أُوقف من المنتج. القائمة ثابتة كي يستطيع التشغيل/النشر حذف كل بياناته
+# القديمة من primary وbackup من دون تخمين أسماء المفاتيح.
+REMOVED_X_SETTING_KEYS = frozenset({
+    "x_logins",
+    "x_accounts",
+    "x_poll_seconds",
+    "x_skip_replies",
+    "x_max_per_cycle",
+    "x_login_cooldown",
+    "x_login_cooldown_emergency",
+    "x_cooldown_key_id",
+    "x_login_cooldowns",
+})
 
 _BACKUP_FORMAT = 2
 _BACKUP_PREPARED = "prepared"
@@ -253,6 +249,18 @@ class Settings:
     def save(self):
         """يحفظ تعديلات مباشرة متعمّدة (يستخدمه configure.py)."""
         self._commit(self.data)
+
+    def scrub_x_integration_data(self):
+        """يحذف إعدادات X القديمة بمعاملة واحدة، ولا ينشئ مفاتيح فارغة."""
+        with self._lock:
+            present = REMOVED_X_SETTING_KEYS.intersection(self.data)
+            if not present:
+                return 0
+            candidate = copy.deepcopy(self.data)
+            for key in present:
+                candidate.pop(key, None)
+            self._commit(candidate)
+            return len(present)
 
     def _replace(self, key, value):
         candidate = copy.deepcopy(self.data)

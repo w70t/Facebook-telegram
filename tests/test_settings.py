@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import settings as settings_module
-from settings import DEFAULTS, Settings
+from settings import DEFAULTS, REMOVED_X_SETTING_KEYS, Settings
 
 TXID_KEY = "__settings_txid"
 
@@ -35,6 +35,25 @@ def test_defaults_are_not_shared_between_instances(tmp_path):
     b = Settings(path=str(tmp_path / "b.json"))
     assert b.filter_words() == []
     assert DEFAULTS["filter_words"] == []
+
+
+def test_disabled_x_defaults_are_absent_and_old_data_is_scrubbed_atomically(
+    settings,
+):
+    assert REMOVED_X_SETTING_KEYS.isdisjoint(DEFAULTS)
+    settings.set_many({
+        "x_logins": [{"username": "reader", "password": "secret"}],
+        "x_accounts": [{"screen_name": "source", "user_id": "1"}],
+        "x_login_cooldown": {"legacy": True},
+    })
+
+    assert settings.scrub_x_integration_data() == 3
+    assert REMOVED_X_SETTING_KEYS.isdisjoint(settings.data)
+    primary = read_document(settings.path)
+    backup = read_document(settings.path + ".bak")
+    assert REMOVED_X_SETTING_KEYS.isdisjoint(primary)
+    assert REMOVED_X_SETTING_KEYS.isdisjoint(backup["data"])
+    assert settings.scrub_x_integration_data() == 0
 
 
 def test_saved_files_are_flat_owner_only_and_hide_transaction_id(settings):
