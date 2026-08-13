@@ -35,6 +35,8 @@
 3. عند ضغط **✅ نشر** يُرفع النص/الصور/الفيديو إلى **صفحة فيسبوك** عبر Graph API.
 
 ## البدء السريع
+
+يتطلب المشروع **Python 3.10 أو أحدث** (جهاز Raspberry Pi الحالي يستخدم 3.13).
 ```bash
 git clone https://github.com/w70t/Facebook-telegram.git
 cd Facebook-telegram

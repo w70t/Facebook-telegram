@@ -5,6 +5,9 @@
 ---
 
 ## 1) التثبيت على Raspberry Pi
+
+استخدم **Python 3.10 أو أحدث**؛ مكتبة X المثبتة لا تعمل فعلياً على Python 3.9
+رغم أن بيانات الحزمة تسمح بتثبيتها عليه.
 ```bash
 git clone https://github.com/w70t/Facebook-telegram.git
 cd Facebook-telegram

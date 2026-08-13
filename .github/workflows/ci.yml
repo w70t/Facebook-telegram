@@ -10,7 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        # Twikit 2.3.3 advertises Python 3.8+, but executes PEP 604 unions at
+        # import time and therefore cannot run on 3.9. Keep the tested floor
+        # honest instead of letting installation succeed and runtime fail.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
