@@ -6,6 +6,7 @@
 import copy
 import json
 import logging
+import math
 import os
 import secrets
 import threading
@@ -42,6 +43,9 @@ DEFAULTS = {
     "x_poll_seconds": 120,
     "x_skip_replies": True,      # X: انسخ التغريدات فقط لا الردود
     "x_max_per_cycle": 5,        # سقف التغريدات لكل دورة (الباقي يأتي في الدورة التالية)
+    # حظر احترازي لمحاولات دخول X. لا يحتوي اسم مستخدم أو كلمة مرور؛ فقط موعد
+    # الانتهاء ومحادثة/رسالة Telegram التي تعرض العداد.
+    "x_login_cooldown": None,
     "filter_words": [],          # كلمات ممنوعة: أي منشور يحتويها يُتجاهل
     # حدود التشغيل — تحمي بطاقة الـ SD من الامتلاء
     "max_media_mb": 200,         # أقصى حجم وسيط يُنزَّل
@@ -52,6 +56,8 @@ _BACKUP_FORMAT = 2
 _BACKUP_PREPARED = "prepared"
 _BACKUP_COMMITTED = "committed"
 _PRIMARY_TXID = "__settings_txid"
+_MAX_UNIX_TIMESTAMP = 253402300799  # 9999-12-31T23:59:59Z
+_MAX_X_LOGIN_COOLDOWN_SECONDS = 24 * 60 * 60
 
 
 def _valid_txid(value):
@@ -415,6 +421,120 @@ class Settings:
             for lg in logins:
                 lg["failed"] = False
             self._replace("x_logins", logins)
+
+    # --- مهلة محاولات دخول X ---
+    @staticmethod
+    def _valid_x_login_cooldown(value):
+        """ينقّي سجل المهلة كيلا تُستخدم بيانات تالفة أو حقول اعتماد دخيلة."""
+        if not isinstance(value, dict):
+            return None
+        generation = value.get("generation")
+        started_at = value.get("started_at")
+        until = value.get("until")
+        duration_seconds = value.get("duration_seconds")
+        chat_id = value.get("chat_id")
+        message_id = value.get("message_id")
+        notified = value.get("notified", False)
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or len(generation) > 128
+            or isinstance(started_at, bool)
+            or not isinstance(started_at, (int, float))
+            or not math.isfinite(started_at)
+            or started_at < 0
+            or started_at > _MAX_UNIX_TIMESTAMP
+            or isinstance(until, bool)
+            or not isinstance(until, (int, float))
+            or not math.isfinite(until)
+            or until <= 0
+            or until > _MAX_UNIX_TIMESTAMP
+            or isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, (int, float))
+            or not math.isfinite(duration_seconds)
+            or duration_seconds < 1
+            or duration_seconds > _MAX_X_LOGIN_COOLDOWN_SECONDS
+            or abs((until - started_at) - duration_seconds) > 1
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id == 0
+            or (
+                message_id is not None
+                and (
+                    isinstance(message_id, bool)
+                    or not isinstance(message_id, int)
+                    or message_id <= 0
+                )
+            )
+            or not isinstance(notified, bool)
+        ):
+            return None
+        return {
+            "generation": generation,
+            "started_at": float(started_at),
+            "until": float(until),
+            "duration_seconds": int(duration_seconds),
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "notified": notified,
+        }
+
+    def x_login_cooldown(self):
+        with self._lock:
+            return copy.deepcopy(
+                self._valid_x_login_cooldown(self.data.get("x_login_cooldown"))
+            )
+
+    def start_x_login_cooldown(
+        self, until, chat_id, *, generation=None, message_id=None,
+        duration_seconds=3600,
+    ):
+        """يستبدل المهلة ذرّياً ويعيد سجلها المنقّى (من دون أي اعتماد X)."""
+        record = self._valid_x_login_cooldown({
+            "generation": generation or secrets.token_hex(16),
+            "started_at": float(until) - float(duration_seconds),
+            "until": until,
+            "duration_seconds": duration_seconds,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "notified": False,
+        })
+        if record is None:
+            raise ValueError("invalid X login cooldown")
+        with self._lock:
+            self._replace("x_login_cooldown", record)
+        return copy.deepcopy(record)
+
+    def set_x_login_cooldown_message(self, generation, message_id):
+        """يربط رسالة العداد بالجيل نفسه؛ لا يستطيع مؤقّت قديم لمس جيل أحدث."""
+        with self._lock:
+            current = self._valid_x_login_cooldown(
+                self.data.get("x_login_cooldown")
+            )
+            if current is None or current["generation"] != generation:
+                return False
+            updated = dict(current)
+            updated["message_id"] = message_id
+            updated = self._valid_x_login_cooldown(updated)
+            if updated is None:
+                raise ValueError("invalid Telegram message id")
+            self._replace("x_login_cooldown", updated)
+            return True
+
+    def mark_x_login_cooldown_notified(self, generation):
+        """يثبّت نجاح إشعار الانتهاء ذرّياً ويمنع الإشعارات المكررة بعد restart."""
+        with self._lock:
+            current = self._valid_x_login_cooldown(
+                self.data.get("x_login_cooldown")
+            )
+            if current is None or current["generation"] != generation:
+                return False
+            if current["notified"]:
+                return True
+            updated = dict(current)
+            updated["notified"] = True
+            self._replace("x_login_cooldown", updated)
+            return True
 
     # --- الحسابات المتابَعة ---
     def x_accounts(self):

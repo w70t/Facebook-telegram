@@ -72,6 +72,16 @@ def app(tmp_path):
                 if not task.done():
                     task.cancel()
             main._x_secret_tasks.clear()
+            cooldown_task = main._x_cooldown_task
+            if cooldown_task is not None and not cooldown_task.done():
+                cooldown_task.cancel()
+            main._x_cooldown_task = None
+            main._x_cooldown_memory = None
+            main._x_cooldown_notifying.clear()
+            main._x_cooldown_notified_memory.clear()
+            main._x_cooldown_lock = None
+            main._x_cooldown_lock_loop = None
+            main._x_cooldown_runtime = None
             main._x_browser_cleanup_unconfirmed = False
             main._x_secret_delete_unconfirmed = False
             main._restarting = False
@@ -141,6 +151,7 @@ class Event:
             raise RuntimeError("Telegram respond failed")
         self.responses.append(text)
         self.response_buttons.append(buttons)
+        return types.SimpleNamespace(id=1000 + self.respond_calls)
 
     async def edit(self, text):
         if self.app and self.item_id:
@@ -161,6 +172,312 @@ def test_app_fixture_always_uses_stub_telethon(app):
     stub = sys.modules["stub_telethon"]
     assert app.TelegramClient is stub.TelegramClient
     assert sys.modules["telethon"].TelegramClient is stub.TelegramClient
+
+
+def test_x_rate_limit_starts_durable_one_hour_countdown(app, monkeypatch):
+    monkeypatch.setattr(app.time, "time", lambda: 1_000.0)
+    event = Event()
+
+    async def scenario():
+        record = await app._activate_x_login_cooldown(event)
+        task = app._x_cooldown_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return record
+
+    record = asyncio.run(scenario())
+    saved = app.S.x_login_cooldown()
+    assert record["until"] == 4_600.0
+    assert saved["chat_id"] == 42
+    assert saved["message_id"] == 1001
+    assert saved["generation"] == record["generation"]
+    assert "01:00:00" in event.responses[0]
+    assert "مدة احترازية" in event.responses[0]
+    assert not any(key in saved for key in ("username", "email", "password"))
+
+
+def test_x_add_is_blocked_with_exact_remaining_countdown(app, monkeypatch):
+    monkeypatch.setattr(app.time, "time", lambda: 1_000.0)
+    app.S.start_x_login_cooldown(4_600, 42, generation="waiting")
+    event = Event(data=b"xlog:add")
+
+    asyncio.run(app.on_xlogin(event))
+
+    assert app._get_state(42) is None
+    assert event.answers == [
+        ("⏳ ما زال عداد X يعمل. المتبقي: 01:00:00. "
+         "سأرسل زر المحاولة عند انتهائه.", True)
+    ]
+
+
+def test_x_countdown_rebases_after_raspberry_clock_rolls_back(app, monkeypatch):
+    now = [1_000.0]
+    monotonic = [10.0]
+    monkeypatch.setattr(app.time, "time", lambda: now[0])
+    monkeypatch.setattr(app.time, "monotonic", lambda: monotonic[0])
+    app.S.start_x_login_cooldown(4_600, 42, generation="clock-skew")
+
+    # يحاكي reboot قبل مزامنة NTP: لا يصبح السجل غير صالح ولا يُفتح الدخول.
+    now[0] = 100.0
+    record = app._x_cooldown_record()
+
+    assert record["generation"] == "clock-skew"
+    assert record["started_at"] == 1_000.0
+    assert record["until"] == 4_600.0
+    assert app._x_cooldown_remaining(record) == 3_600
+    assert app.Settings(path=app.S.path).x_login_cooldown() == record
+
+    # مزامنة NTP تقفز بالساعة الجدارية للأمام، لكن العداد داخل العملية يعتمد
+    # الزمن الرتيب ولا ينتهي قبل مرور الساعة الحقيقية.
+    now[0] = 5_000.0
+    monotonic[0] = 20.0
+    assert app._x_cooldown_remaining(app._x_cooldown_record()) == 3_590
+
+
+def test_restart_creates_missing_countdown_message_once(app, monkeypatch):
+    now = [1_000.0]
+    monkeypatch.setattr(app.time, "time", lambda: now[0])
+    app.S.start_x_login_cooldown(4_600, 42, generation="preseed")
+    sends = []
+
+    async def send_message(chat_id, text, buttons=None):
+        sends.append((chat_id, text, buttons))
+        return types.SimpleNamespace(id=777)
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    assert asyncio.run(app._create_x_cooldown_message("preseed")) is True
+    assert asyncio.run(app._create_x_cooldown_message("preseed")) is True
+
+    assert len(sends) == 1
+    assert sends[0][0] == 42
+    assert "01:00:00" in sends[0][1]
+    assert app.S.x_login_cooldown()["message_id"] == 777
+
+
+def test_new_countdown_survives_ntp_jump_during_first_telegram_rpc(
+    app, monkeypatch,
+):
+    wall = [100.0]
+    monotonic = [10.0]
+    monkeypatch.setattr(app.time, "time", lambda: wall[0])
+    monkeypatch.setattr(app.time, "monotonic", lambda: monotonic[0])
+    event = Event()
+    original_respond = event.respond
+
+    async def respond_and_sync_clock(text, buttons=None):
+        wall[0] = 5_000.0
+        monotonic[0] = 11.0
+        return await original_respond(text, buttons=buttons)
+
+    event.respond = respond_and_sync_clock
+
+    async def scenario():
+        await app._activate_x_login_cooldown(event)
+        remaining = app._x_cooldown_remaining(app._x_cooldown_record())
+        task = app._x_cooldown_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return remaining
+
+    assert asyncio.run(scenario()) == 3_599
+
+
+def test_expired_x_countdown_notifies_once_after_restart(app, monkeypatch):
+    monkeypatch.setattr(app.time, "time", lambda: 5_000.0)
+    app.S.start_x_login_cooldown(
+        4_999, 42, generation="expired", message_id=321,
+    )
+    edits = []
+    sends = []
+
+    async def edit_message(chat_id, message_id, text, buttons=None):
+        edits.append((chat_id, message_id, text, buttons))
+
+    async def send_message(chat_id, text, buttons=None):
+        sends.append((chat_id, text, buttons))
+        return types.SimpleNamespace(id=999)
+
+    monkeypatch.setattr(app.bot, "edit_message", edit_message, raising=False)
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    asyncio.run(app._run_x_cooldown("expired"))
+    asyncio.run(app._run_x_cooldown("expired"))
+
+    assert len(edits) == 1
+    assert edits[0][:2] == (42, 321)
+    assert len(sends) == 1
+    assert sends[0][0] == 42
+    assert sends[0][2][0][0].data == b"xlog:add"
+    assert app.S.x_login_cooldown()["notified"] is True
+
+
+def test_failed_ready_notification_remains_pending_and_retries(app, monkeypatch):
+    monkeypatch.setattr(app.time, "time", lambda: 5_000.0)
+    app.S.start_x_login_cooldown(4_999, 42, generation="retry")
+    calls = []
+
+    async def send_message(chat_id, text, buttons=None):
+        calls.append((chat_id, text, buttons))
+        if len(calls) == 1:
+            raise RuntimeError("Telegram unavailable")
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    assert asyncio.run(app._notify_x_cooldown_ready("retry")) is False
+    assert app.S.x_login_cooldown()["notified"] is False
+    assert asyncio.run(app._notify_x_cooldown_ready("retry")) is True
+    assert len(calls) == 2
+    assert app.S.x_login_cooldown()["notified"] is True
+
+
+def test_expired_countdown_does_not_notify_revoked_admin(app, monkeypatch):
+    app.S.add_admin(84)
+    app.S.start_x_login_cooldown(
+        app.time.time() - 1, 84, generation="revoked",
+    )
+    app.S.remove_admin(84)
+    sends = []
+
+    async def send_message(*args, **kwargs):
+        sends.append((args, kwargs))
+
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    assert asyncio.run(app._notify_x_cooldown_ready("revoked")) is True
+    assert sends == []
+    assert app.S.x_login_cooldown()["notified"] is True
+
+
+def test_new_cooldown_wins_before_stale_ready_notifier_can_send(app, monkeypatch):
+    app.S.start_x_login_cooldown(
+        app.time.time() - 1, 42, generation="old",
+    )
+    started = None
+    release = None
+    sends = []
+    event = Event()
+    original_respond = event.respond
+
+    async def blocked_respond(text, buttons=None):
+        started.set()
+        await release.wait()
+        return await original_respond(text, buttons=buttons)
+
+    async def send_message(*args, **kwargs):
+        sends.append((args, kwargs))
+
+    event.respond = blocked_respond
+    monkeypatch.setattr(app.bot, "send_message", send_message, raising=False)
+
+    async def scenario():
+        nonlocal started, release
+        started = asyncio.Event()
+        release = asyncio.Event()
+        activation = asyncio.create_task(app._activate_x_login_cooldown(event))
+        await started.wait()
+        new_generation = app.S.x_login_cooldown()["generation"]
+        stale = asyncio.create_task(app._notify_x_cooldown_ready("old"))
+        await asyncio.sleep(0)
+        assert not stale.done()
+        release.set()
+        await activation
+        await stale
+        task = app._x_cooldown_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return new_generation
+
+    new_generation = asyncio.run(scenario())
+    assert app.S.x_login_cooldown()["generation"] == new_generation
+    assert sends == []
+
+
+def test_cooldown_starting_during_secret_delete_stops_before_browser(
+    app, monkeypatch,
+):
+    login_calls = []
+
+    async def delete_and_start_cooldown(event):
+        event.deleted = True
+        app.S.start_x_login_cooldown(
+            app.time.time() + 3600, 42, generation="race",
+        )
+        return True
+
+    async def login_interactive(*args, **kwargs):
+        login_calls.append((args, kwargs))
+
+    monkeypatch.setattr(app, "_delete_secret_message", delete_and_start_cooldown)
+    monkeypatch.setattr(app.xreader, "login_interactive", login_interactive)
+    event = Event(text="must-not-be-used")
+
+    asyncio.run(app._save_x_login(
+        event,
+        {
+            "x_username": "reader",
+            "x_email": None,
+            "x_chat_id": 42,
+            "x_setup_id": "setup-race",
+        },
+        event.text,
+    ))
+
+    assert event.deleted is True
+    assert login_calls == []
+    assert app._x_login_tasks == {}
+    assert any("أُوقفت المحاولة قبل الاتصال" in text for text in event.responses)
+
+
+def test_rate_limit_clears_credentials_before_countdown_rpc(app, monkeypatch):
+    credential_refs = []
+    activation_checks = []
+
+    async def rate_limited(credentials, _challenge_handler):
+        credential_refs.append(credentials)
+        raise app.XBrowserRateLimited("internal detail")
+
+    async def assert_cleared_before_await(_event):
+        activation_checks.append(dict(credential_refs[0]))
+
+    monkeypatch.setattr(app.xreader, "login_interactive", rate_limited)
+    monkeypatch.setattr(app, "_activate_x_login_cooldown", assert_cleared_before_await)
+    event = Event(text="must-disappear")
+
+    asyncio.run(app._save_x_login(
+        event,
+        {"x_username": "reader", "x_email": None, "x_chat_id": 42},
+        event.text,
+    ))
+
+    assert activation_checks == [{}]
+    assert credential_refs[0] == {}
+    assert app.S.x_logins() == []
+
+
+def test_x_cooldown_shutdown_is_bounded_if_task_resists_cancel(app):
+    async def scenario():
+        release = asyncio.Event()
+
+        async def resistant():
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        task = asyncio.create_task(resistant())
+        app._x_cooldown_task = task
+        await asyncio.sleep(0)
+        await app._shutdown_x_cooldown(timeout=0.01)
+        assert app._x_cooldown_task is None
+        release.set()
+        await task
+
+    asyncio.run(scenario())
 
 
 def test_concurrent_publish_claim_allows_only_one_facebook_call(app, monkeypatch):
