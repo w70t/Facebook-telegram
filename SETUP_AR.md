@@ -5,11 +5,16 @@
 ---
 
 ## 1) التثبيت على Raspberry Pi
+
+استخدم **Python 3.10 أو أحدث**؛ مكتبة X المثبتة لا تعمل فعلياً على Python 3.9
+رغم أن بيانات الحزمة تسمح بتثبيتها عليه.
 ```bash
 git clone https://github.com/w70t/Facebook-telegram.git
 cd Facebook-telegram
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+PLAYWRIGHT_BROWSERS_PATH="$PWD/playwright-browsers" \
+  python -m playwright install --only-shell chromium
 ```
 
 ## 2) الإعداد الأولي (مرة واحدة فقط)

@@ -4,6 +4,7 @@
 
 ملاحظة: twikit غير رسمية وقد تتغيّر واجهتها؛ الكود مكتوب دفاعياً.
 """
+import json
 import logging
 import os
 import re
@@ -20,6 +21,14 @@ SessionRef = namedtuple("SessionRef", "generation client username")
 
 class XSessionSuperseded(RuntimeError):
     """أُبطلت محاولة تفعيل/دخول لأن عملية أحدث غيّرت جلسة X."""
+
+
+class XSessionAccountMismatch(RuntimeError):
+    """The authenticated browser session belongs to a different X account."""
+
+
+class XSessionVerificationError(RuntimeError):
+    """The browser authenticated, but the reader could not verify the session."""
 
 # لا نعلّم الحساب failed إلا عند دليل قطعي على بيانات اعتماد خاطئة أو تعطيل الحساب.
 # 403/Forbidden وblocked/denied قد تكون قيود endpoint أو rate-limit وليست دليلاً.
@@ -38,7 +47,7 @@ AUTH_EXC_NAMES = {
 
 ACCOUNT_DISABLED_EXC_NAMES = {"AccountSuspended", "AccountLocked"}
 INTERACTIVE_AUTH_EXC_NAMES = {
-    "XCredentialsRejected", "AccountSuspended", "AccountLocked",
+    "AccountSuspended", "AccountLocked",
 }
 ACCOUNT_DISABLED_HINTS = re.compile(
     r"\b(?:account\s+(?:(?:is|has\s+been)\s+)?(?:suspend\w*|locked)|"
@@ -247,6 +256,8 @@ def _is_account_disabled(exc):
 
 def _is_session_invalid(exc):
     return (
+        isinstance(exc, XSessionAccountMismatch)
+        or
         type(exc).__name__ in AUTH_EXC_NAMES
         or bool(SESSION_INVALID_HINTS.search(str(exc)))
     )
@@ -277,8 +288,52 @@ class XReader:
 
     def _new_client(self):
         from twikit import Client  # استيراد كسول
+        from xtransaction import TwikitTransactionAdapter
 
-        return Client("en-US")
+        client = Client("en-US")
+        client.client_transaction = TwikitTransactionAdapter()
+        # Twikit 2.3.3 rebuilds its CookieJar as a list inside this helper,
+        # stripping domains after every request. Replace it with a scoped
+        # equivalent so auth_token/ct0 can never become domainless.
+        def remove_duplicate_ct0_cookie():
+            scoped = {}
+            for cookie in client.http.cookies.jar:
+                if cookie.name == "ct0" and "ct0" in scoped:
+                    continue
+                scoped[cookie.name] = cookie.value
+            self._set_x_cookies(client, scoped)
+
+        client._remove_duplicate_ct0_cookie = remove_duplicate_ct0_cookie
+        return client
+
+    @staticmethod
+    def _set_x_cookies(client, cookies):
+        """Scope authenticated cookies to X; never create domainless secrets."""
+        jar = getattr(getattr(client, "http", None), "cookies", None)
+        if jar is None or not callable(getattr(jar, "set", None)):
+            setter = getattr(client, "set_cookies", None)
+            if callable(setter):
+                setter(cookies, clear_cookies=True)
+                return
+            raise XSessionVerificationError("X client cookie jar is unavailable")
+        jar.clear()
+        for name, value in cookies.items():
+            jar.set(name, value, domain=".x.com", path="/")
+
+    @classmethod
+    def _load_x_cookies(cls, client, path):
+        try:
+            with open(path, encoding="utf-8") as cookie_file:
+                cookies = json.load(cookie_file)
+        except (OSError, ValueError, TypeError):
+            raise XSessionVerificationError("X cookie file is invalid") from None
+        if not isinstance(cookies, dict) or not all(
+            isinstance(name, str) and isinstance(value, str)
+            for name, value in cookies.items()
+        ):
+            raise XSessionVerificationError("X cookie file is invalid")
+        cls._set_x_cookies(client, cookies)
+        cookies.clear()
 
     def invalidate(self):
         """يُبطل الجلسة الحالية ليُعاد اختيار حساب نشط."""
@@ -308,9 +363,37 @@ class XReader:
         """
         probe = getattr(client, "user", None)
         if callable(probe):
-            await probe()
+            authenticated = await probe()
+            actual = getattr(authenticated, "screen_name", None)
+            if not isinstance(actual, str) or not actual.strip():
+                raise XSessionVerificationError(
+                    "X did not identify the authenticated account"
+                )
+            if actual.strip().lstrip("@").casefold() != str(username).strip().lstrip("@").casefold():
+                raise XSessionAccountMismatch(
+                    "X browser session account did not match the requested account"
+                )
             return
-        await client.get_user_by_screen_name(username)
+        # A client without ``user()`` cannot prove which account owns a cookie.
+        raise XSessionVerificationError("X client cannot identify its authenticated account")
+
+    @staticmethod
+    async def _prepare_transaction(client):
+        """Initialize public transaction data before authenticated cookies exist."""
+        adapter = getattr(client, "client_transaction", None)
+        if adapter is None or not callable(getattr(adapter, "init", None)):
+            if client.__class__.__module__.startswith(("test_", "tests.")):
+                return
+            raise XSessionVerificationError("X transaction adapter is unavailable")
+        if getattr(adapter, "home_page_response", None) is not None:
+            return
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Referer": "https://x.com",
+            "User-Agent": getattr(client, "_user_agent", "Mozilla/5.0"),
+        }
+        await adapter.init(getattr(client, "http", None), headers)
 
     def _set_active(self, client, username):
         self._session_generation += 1
@@ -358,7 +441,10 @@ class XReader:
             return False
         client = self._new_client()
         _restrict(cpath)              # يصلح ملفات أُنشئت بصلاحيات مفتوحة سابقاً
-        client.load_cookies(cpath)
+        await self._prepare_transaction(client)
+        if generation != self._session_generation:
+            return False
+        self._load_x_cookies(client, cpath)
         await self._verify(client, username)
         if generation != self._session_generation:
             return False
@@ -388,18 +474,32 @@ class XReader:
         generation = self._session_generation
         username, auth_info_2, password = self._validate_credential(cred)
         client = self._new_client()
+        browser_cookies = None
         try:
-            from xauth import login_with_challenges
+            from xbrowser import obtain_cookies
 
-            await login_with_challenges(
-                client,
-                auth_info_1=username,
-                auth_info_2=auth_info_2,
-                password=password,
+            await self._prepare_transaction(client)
+            self._require_generation(generation)
+            browser_cookies = await obtain_cookies(
+                {
+                    "username": username,
+                    "email": auth_info_2,
+                    "password": password,
+                },
                 challenge_handler=challenge_handler,
             )
+            password = None
             self._require_generation(generation)
-            await self._verify(client, username)
+            self._set_x_cookies(client, browser_cookies)
+            browser_cookies.clear()
+            try:
+                await self._verify(client, username)
+            except (XSessionAccountMismatch, XSessionVerificationError):
+                raise
+            except Exception:  # noqa: BLE001 - expose no remote response details
+                raise XSessionVerificationError(
+                    "X reader session verification failed"
+                ) from None
             self._require_generation(generation)
         except Exception as e:  # noqa: BLE001
             # نتيجة محاولة قديمة لا تملك صلاحية تعطيل credential بعد أن بدّلت
@@ -408,6 +508,10 @@ class XReader:
                 self._mark_failed_if_auth(username, e)
             log.warning("فشل تسجيل X التفاعلي (%s)", type(e).__name__)
             raise
+        finally:
+            password = None
+            if browser_cookies is not None:
+                browser_cookies.clear()
 
         cpath = _cookies_path(username)
         try:

@@ -4,3 +4,9 @@ telethon>=1.42,<2
 requests>=2.31
 # xauth.py يتكامل مع تدفق onboarding الداخلي؛ لا تحدّثه دون تشغيل test_xauth.py.
 twikit==2.3.3
+# Twikit 2.3.3 no longer discovers X's ondemand transaction asset itself.
+xclienttransaction==1.0.3
+# Chromium is installed separately on Raspberry Pi and is only launched for
+# explicit login. The project floor is Python 3.10 because Twikit 2.3.3 uses
+# runtime ``type | type`` expressions despite advertising older versions.
+playwright==1.60.0

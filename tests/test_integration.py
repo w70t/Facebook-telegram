@@ -454,6 +454,15 @@ class FakeXClient:
         self.tweets = tweets or []
         self.logged_in = False
         self.saved_to = None
+        self.cookies = {}
+
+    def set_cookies(self, cookies, clear_cookies=False):
+        if clear_cookies:
+            self.cookies.clear()
+        self.cookies.update(cookies)
+
+    def get_cookies(self):
+        return dict(self.cookies)
 
     def load_cookies(self, path):
         self.loaded_from = path
@@ -466,7 +475,7 @@ class FakeXClient:
     async def user(self):
         if not self.cookies_valid and not self.logged_in:
             raise Exception("401 Unauthorized")
-        return type("U", (), {"id": 1, "name": "me"})()
+        return type("U", (), {"id": 1, "name": "me", "screen_name": "acct"})()
 
     async def login(self, **kwargs):
         self.logged_in = True
