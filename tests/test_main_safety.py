@@ -68,6 +68,17 @@ def app(tmp_path):
             main._x_login_deleting.clear()
             main._x_login_cancelled.clear()
             main._x_secret_tombstones.clear()
+            for task in list(main._x_secret_tasks):
+                if not task.done():
+                    task.cancel()
+            main._x_secret_tasks.clear()
+            main._x_browser_cleanup_unconfirmed = False
+            main._x_secret_delete_unconfirmed = False
+            main._restarting = False
+            restart_task = main._restart_task
+            if restart_task is not None and not restart_task.done():
+                restart_task.cancel()
+            main._restart_task = None
             for future in list(main._x_challenges.values()):
                 if not future.done():
                     future.cancel()
@@ -553,11 +564,12 @@ def test_x_authenticator_code_round_trip_is_deleted_and_not_stored(app, monkeypa
     assert captured["code"] == "739184"
     assert captured["credentials"]["password"] == "account-password"
     assert app.S.x_logins()[0]["username"] == "reader"
-    assert app.S.x_logins()[0]["password"] == "account-password"
+    assert app.S.x_logins()[0]["password"] is None
     with open(app.S.path, encoding="utf-8") as settings_file:
         settings_text = settings_file.read()
     assert "739184" not in settings_text
     assert "739 184" not in settings_text
+    assert "account-password" not in settings_text
     all_replies = "\n".join(password_event.responses + code_event.responses)
     assert "739184" not in all_replies
 
@@ -1148,7 +1160,7 @@ def test_x_password_is_not_trimmed_and_may_start_with_slash(app, monkeypatch):
     asyncio.run(app.on_text(event))
 
     assert captured[0]["password"] == "/ exact password "
-    assert app.S.x_logins()[0]["password"] == "/ exact password "
+    assert app.S.x_logins()[0]["password"] is None
     assert event.deleted is True
 
 
@@ -2147,3 +2159,79 @@ def test_new_setup_does_not_clear_late_secret_tombstone(app):
     intended = Event(text="intended-filter")
     asyncio.run(app.on_text(intended))
     assert "intended-filter" in app.S.filter_words()
+
+
+def test_shutdown_waits_for_inflight_secret_message_deletion(app):
+    event = Event(text="secret")
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_delete():
+            started.set()
+            await release.wait()
+            event.deleted = True
+
+        event.delete = blocked_delete
+        deleting = asyncio.create_task(app._delete_secret_message(event))
+        await started.wait()
+        shutdown = asyncio.create_task(app._shutdown_x_logins(timeout=1))
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        assert app._x_secret_tasks
+        release.set()
+        assert await deleting is True
+        assert await shutdown is True
+
+    asyncio.run(scenario())
+    assert event.deleted is True
+    assert app._x_secret_tasks == set()
+
+
+def test_shutdown_refuses_unconfirmed_browser_cleanup(app):
+    app._x_browser_cleanup_unconfirmed = True
+    assert asyncio.run(app._shutdown_x_logins(timeout=0.1)) is False
+
+
+def test_shutdown_refuses_orphan_secret_deletion_failure(app):
+    event = Event(text="one-time-code")
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def failing_delete():
+            started.set()
+            await release.wait()
+            raise RuntimeError("Telegram delete denied")
+
+        event.delete = failing_delete
+        handler = asyncio.create_task(app._delete_secret_message(event))
+        await started.wait()
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        assert app._x_secret_tasks
+        shutdown = asyncio.create_task(app._shutdown_x_logins(timeout=1))
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        release.set()
+        assert await shutdown is False
+
+    asyncio.run(scenario())
+    assert app._x_secret_tasks == set()
+
+
+def test_completed_secret_deletion_failure_persists_until_restart(app):
+    event = Event(text="visible-secret", fail_delete=True)
+
+    async def scenario():
+        assert await app._delete_secret_message(event) is False
+        assert app._x_secret_tasks == set()
+        # Even though the failed child finished before the shutdown snapshot,
+        # the process must not forget that a secret may still be visible.
+        assert await app._shutdown_x_logins(timeout=0.1) is False
+
+    asyncio.run(scenario())
+    assert app._x_secret_delete_unconfirmed is True

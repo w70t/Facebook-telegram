@@ -40,6 +40,8 @@ git clone https://github.com/w70t/Facebook-telegram.git
 cd Facebook-telegram
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+PLAYWRIGHT_BROWSERS_PATH="$PWD/playwright-browsers" \
+  python -m playwright install --only-shell chromium
 
 python configure.py   # مرة واحدة: api_id + api_hash + توكن البوت
 python main.py        # شغّل البوت
@@ -135,7 +137,9 @@ python -m pyflakes *.py tests/*.py
 | `store.py` | المنشورات المعلّقة (محفوظة على القرص + تنظيف دوري) |
 | `jsonio.py` | كتابة/قراءة JSON ذرّية مع استرجاع من التلف |
 | `util.py` | دوال خالصة (حدود النص، تطبيع الأرقام) |
-| `xauth.py` | تسجيل X التفاعلي وتحديات Authenticator دون `input()` |
+| `xbrowser.py` | تسجيل X عبر Chromium معزول وتحديات Authenticator دون ملفات profile |
+| `xtransaction.py` | توافق قارئ X مع transaction assets الحالية |
+| `xauth.py` | محوّل Twikit القديم (لا يُستخدم لتسجيل الدخول الجديد) |
 | `configure.py` | معالج أولي لمرة واحدة (القيم الثلاث الأساسية) |
 | `facebook.py` | النشر على فيسبوك عبر Graph API (ألبومات + إعادة محاولة) |
 | `twitter.py` | قارئ X غير الرسمي عبر twikit + تبديل الحسابات |

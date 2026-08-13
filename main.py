@@ -37,7 +37,17 @@ from facebook import (
 )
 from settings import BASE_DIR, Settings
 from store import PendingStore
-from twitter import XReader
+from twitter import XReader, XSessionAccountMismatch, XSessionVerificationError
+from xbrowser import (
+    XBrowserCleanupError,
+    XBrowserChallengeRejected,
+    XBrowserCredentialsRejected,
+    XBrowserPageChanged,
+    XBrowserSessionError,
+    XBrowserUnavailable,
+    XBrowserUnsupportedChallenge,
+)
+from xtransaction import XTransactionCompatibilityError, XTransactionNetworkError
 from util import (
     CAPTION_LIMIT,
     TEXT_LIMIT,
@@ -54,6 +64,15 @@ logging.basicConfig(
 log = logging.getLogger("tg2fb")
 
 S = Settings()
+
+try:
+    _scrubbed_x_passwords = S.scrub_x_login_passwords()
+    if _scrubbed_x_passwords:
+        log.info("حُذفت %d كلمة مرور X قديمة من الإعدادات", _scrubbed_x_passwords)
+except OSError as exc:
+    # لا تُستخدم كلمة المرور القديمة في الخلفية أو مسار المتصفح، لكن نعيد محاولة
+    # حذفها في التشغيل التالي إذا كان القرص مؤقتاً للقراءة فقط/ممتلئاً.
+    log.error("تعذّر حذف كلمات مرور X القديمة من القرص (%s)", type(exc).__name__)
 
 if not S.bootstrap_ready():
     print("❌ لم يتم الإعداد الأولي بعد. شغّل أولاً:  python configure.py")
@@ -140,6 +159,7 @@ HOUSEKEEPING_SECONDS = 3600
 X_CHALLENGE_TIMEOUT = 180          # رمز X مؤقت؛ لا نحتفظ به أكثر من 3 دقائق
 X_SECRET_DELETE_TIMEOUT = 15       # لا نحتفظ بكلمة المرور بسبب RPC معلّق بلا حد
 X_SECRET_TOMBSTONE_TTL = STATE_TTL # يغطي مهلة كل محادثة إعداد/رمز متأخر
+X_LOGIN_SHUTDOWN_TIMEOUT = 55      # يسمح بإغلاق Chromium المحمي قبل restart/exit
 
 # محاولة تسجيل X تبقى داخل الذاكرة فقط. لا نضع كلمة المرور أو رمز الاستخدام
 # الواحد في state، ولا نكتب رمز Authenticator إلى settings.json.
@@ -148,6 +168,11 @@ _x_challenges: dict[tuple[int, int], asyncio.Future] = {}
 _x_login_deleting: set[int] = set()
 _x_login_cancelled: set[int] = set()
 _x_secret_tombstones: dict[tuple[int, int], float] = {}
+_x_secret_tasks: set[asyncio.Task] = set()
+_x_browser_cleanup_unconfirmed = False
+_x_secret_delete_unconfirmed = False
+_restarting = False
+_restart_task = None
 
 MAX_CLAIM_ATTEMPTS = 5
 _claim_code = None
@@ -205,15 +230,42 @@ def _purge_states():
 
 async def _delete_secret_message(event):
     """يحذف كلمة المرور/الرمز ويعيد ما إذا ضمن Telegram نجاح الحذف."""
+    global _x_secret_delete_unconfirmed
+    # The deletion is its own tracked task.  Telethon cancels event-handler
+    # tasks while disconnecting; shielding the RPC lets the restart
+    # coordinator wait for this child before replacing the process.
+    async def delete_once():
+        try:
+            await event.delete()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - caller decides whether to warn/abort
+            return False
+
+    delete_task = asyncio.create_task(delete_once())
+    _x_secret_tasks.add(delete_task)
     try:
-        await asyncio.wait_for(event.delete(), timeout=X_SECRET_DELETE_TIMEOUT)
-        return True
-    except asyncio.TimeoutError:
-        log.warning("انتهت مهلة حذف رسالة سرية من Telegram")
-        return False
-    except Exception:  # noqa: BLE001
-        log.warning("تعذّر حذف رسالة سرية من Telegram")
-        return False
+        try:
+            deleted = await asyncio.wait_for(
+                asyncio.shield(delete_task), timeout=X_SECRET_DELETE_TIMEOUT,
+            )
+            _x_secret_tasks.discard(delete_task)
+            if not deleted:
+                _x_secret_delete_unconfirmed = True
+                log.warning("تعذّر حذف رسالة سرية من Telegram")
+            return deleted
+        except asyncio.TimeoutError:
+            delete_task.cancel()
+            await asyncio.gather(delete_task, return_exceptions=True)
+            _x_secret_tasks.discard(delete_task)
+            _x_secret_delete_unconfirmed = True
+            log.warning("انتهت مهلة حذف رسالة سرية من Telegram")
+            return False
+    except asyncio.CancelledError:
+        # Do not cancel the Telegram deletion.  It remains in
+        # _x_secret_tasks and is drained by the restart/shutdown coordinator.
+        raise
 
 
 def _remember_x_secret_tombstone(uid, st):
@@ -302,6 +354,65 @@ def _cancel_x_login(uid, *, cancel_task=True, remember_secret=True):
     ):
         task.cancel()
     return task
+
+
+async def _shutdown_x_logins(timeout=X_LOGIN_SHUTDOWN_TIMEOUT):
+    """Cancel every interactive X login and wait for browser cleanup."""
+    global _x_secret_delete_unconfirmed
+    current_task = asyncio.current_task()
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        login_pending = set()
+        for uid, task in list(_x_login_tasks.items()):
+            _cancel_x_login(uid)
+            if task is not None and task is not current_task and not task.done():
+                login_pending.add(task)
+        # Include completed orphan deletions too: their boolean result must be
+        # inspected before restart, not discarded merely because the RPC ended.
+        secret_pending = {
+            task for task in _x_secret_tasks if task is not current_task
+        }
+        pending = login_pending | secret_pending
+        if not pending and not any(
+            task is not current_task and task is not None and not task.done()
+            for task in _x_login_tasks.values()
+        ) and not any(
+            task is not current_task and not task.done()
+            for task in _x_secret_tasks
+        ):
+            return not (
+                _x_browser_cleanup_unconfirmed
+                or _x_secret_delete_unconfirmed
+            )
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            log.error("انتهت مهلة إغلاق متصفح تسجيل X؛ أُلغي restart الآمن")
+            return False
+        try:
+            tasks = list(pending)
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=remaining,
+            )
+            result_by_task = dict(zip(tasks, results))
+            if any(
+                isinstance(result_by_task.get(task), XBrowserCleanupError)
+                for task in login_pending
+            ):
+                return False
+            secret_ok = True
+            for task in secret_pending:
+                result = result_by_task.get(task)
+                _x_secret_tasks.discard(task)
+                if result is not True:
+                    secret_ok = False
+            if not secret_ok:
+                _x_secret_delete_unconfirmed = True
+                log.error("تعذّر تأكيد حذف رسالة سرية؛ أُلغي restart الآمن")
+                return False
+        except asyncio.TimeoutError:
+            log.error("انتهت مهلة إغلاق متصفح تسجيل X؛ أُلغي restart الآمن")
+            return False
 
 
 def _cancel_setup_for_navigation(uid):
@@ -435,11 +546,17 @@ async def _wait_for_x_challenge(event, kind, _prompt="", setup_id=None):
             "🔐 افتح تطبيق Authenticator وأرسل **الرمز الحالي من 6 أرقام**.\n"
             "سأحذف الرسالة فوراً، والرمز لا يُحفظ. تنتهي المهلة بعد 3 دقائق."
         )
+    elif kind == "alternate_identifier":
+        text = (
+            "👤 طلب X معلومة ثانية للتأكد من الحساب. أرسل **البريد أو رقم الهاتف "
+            "أو اسم المستخدم** المرتبط بالحساب. هذا ليس رمز Authenticator.\n"
+            "سأحذف الرسالة فوراً ولن أخزنها. تنتهي المهلة بعد 3 دقائق."
+        )
     else:
         text = (
-            "📩 طلب X تحققاً إضافياً. أرسل القيمة التي يطلبها الآن "
-            "(قد تكون رمزاً أو البريد/الهاتف).\n"
-            "سأحذف الرسالة فوراً ولن أخزنها. تنتهي المهلة بعد 3 دقائق."
+            "📩 أرسل **رمز التحقق المؤقت** الذي أرسله X إلى البريد أو الهاتف.\n"
+            "لا ترسل كلمة المرور أو مفتاح Authenticator السري. سأحذف الرسالة "
+            "فوراً ولن أخزنها. تنتهي المهلة بعد 3 دقائق."
         )
     try:
         await event.respond(
@@ -470,12 +587,23 @@ async def _wait_for_x_challenge(event, kind, _prompt="", setup_id=None):
 
 
 async def _submit_x_challenge_code(event, st, raw):
+    """Submit a code; secret deletion itself is tracked independently."""
+    return await _submit_x_challenge_code_impl(event, st, raw)
+
+
+async def _submit_x_challenge_code_impl(event, st, raw):
     """يسلّم رمزاً مؤقتاً لمحاولة X دون تسجيله أو تخزينه."""
     uid = event.sender_id
     context_ok = _x_private_context_matches(event, st)
     key = _x_challenge_key(event)
     original_future = _x_challenges.get(key)
     deleted = await _delete_secret_message(event)
+    if _restarting:
+        if not deleted:
+            await event.respond(
+                "⚠️ لم أستخدم الرمز لأن البوت قيد التحديث، وتعذّر حذفه. احذف الرسالة يدوياً فوراً."
+            )
+        return
     # لا نسلّم رمزاً التُقط من محاولة قديمة إلى challenge أحدث في نفس chat.
     if state.get(uid) is not st or _x_challenges.get(key) is not original_future:
         if not deleted:
@@ -1462,6 +1590,9 @@ async def on_xlogin(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
         return
+    if _restarting:
+        await event.answer("البوت قيد التحديث؛ حاول إضافة حساب X بعد عودته.", alert=True)
+        return
     if await _reject_callback_during_x_setup(event):
         return
     action = event.data.decode().split(":", 1)[1]
@@ -1527,6 +1658,9 @@ async def on_xsetup(event):
         prefix, setup_id, action = event.data.decode().split(":", 2)
     except (AttributeError, UnicodeDecodeError, ValueError):
         await event.answer("زر غير صالح.", alert=True)
+        return
+    if _restarting and action != "cancel":
+        await event.answer("البوت قيد التحديث؛ استخدم إلغاء أو حاول بعد عودته.", alert=True)
         return
     current_id = st.get("x_setup_id")
     if (
@@ -1699,6 +1833,37 @@ def _run(cmd, timeout):
 
 
 async def _self_update(event):
+    global _restarting, _restart_task
+    if _restarting:
+        await event.respond("⏳ يوجد تحديث أو إيقاف آمن جارٍ بالفعل.")
+        return
+    _restarting = True
+    async def coordinator():
+        global _restarting, _restart_task
+        try:
+            if not await _shutdown_x_logins():
+                await event.respond(
+                    "❌ لم أبدأ التحديث لأن متصفح X لم يُغلق بأمان. ألغِ المحاولة ثم أعد التحديث."
+                )
+                return
+            return await _self_update_impl(event)
+        finally:
+            _restarting = False
+            if _restart_task is asyncio.current_task():
+                _restart_task = None
+
+    # This task is deliberately separate from Telethon's handler task.
+    # bot.disconnect() cancels handlers, but must not cancel the coordinator
+    # before it has drained secret deletion/browser cleanup and exec'd.
+    _restart_task = asyncio.create_task(coordinator())
+    try:
+        return await asyncio.shield(_restart_task)
+    except asyncio.CancelledError:
+        # The coordinator remains alive and owns the restart lifecycle.
+        raise
+
+
+async def _self_update_impl(event):
     """
     يسحب آخر نسخة ثم يعيد التشغيل — لكن فقط عند نجاح السحب فعلاً.
     كان يعيد التشغيل حتى لو فشل git pull، ولا يثبّت الاعتماديات الجديدة.
@@ -1745,11 +1910,28 @@ async def _self_update(event):
 
     await event.respond("♻️ إعادة تشغيل البوت…")
     await asyncio.sleep(1)
-    try:
-        await bot.disconnect()
-        await user.disconnect()
-    finally:
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+    # Stop dispatching new bot handlers before the final drain.  Existing
+    # handlers can finish deleting any secret message while Telegram remains
+    # connected.  The coordinator itself is not one of these handlers.
+    handlers = list(bot.list_event_handlers())
+    for callback, builder in handlers:
+        bot.remove_event_handler(callback, builder)
+    if not await _shutdown_x_logins():
+        for callback, builder in handlers:
+            bot.add_event_handler(callback, builder)
+        await event.respond(
+            "❌ لم أعد التشغيل لأن متصفح X أو حذف رسالة سرية لم يكتمل بأمان. حاول الإلغاء ثم أعد التحديث."
+        )
+        return
+    # The safety gate already passed.  Attempt both disconnects independently;
+    # one client failure must not strand a live process with all handlers
+    # removed and prevent the other client from closing.
+    for client in (bot, user):
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            log.exception("تعذّر فصل عميل Telegram أثناء restart")
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
 
 # ============ الحالة ============
@@ -2318,10 +2500,19 @@ async def _save_fb_token(event, token):
 
 
 async def _save_x_login(event, st, password):
+    global _x_browser_cleanup_unconfirmed
     username = st.get("x_username")
     email = st.get("x_email")
     setup_id = st.get("x_setup_id") or _new_x_setup_id()
     uid = event.sender_id
+    if _restarting:
+        deleted = await _delete_secret_message(event)
+        _cancel_x_login(uid)
+        await event.respond(
+            "⏳ لم أستخدم كلمة المرور لأن البوت قيد التحديث. حاول بعد عودته."
+            + ("" if deleted else " احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        )
+        return
     if not _x_private_context_matches(event, st):
         deleted = await _delete_secret_message(event)
         await event.respond(
@@ -2357,6 +2548,10 @@ async def _save_x_login(event, st, password):
         await event.respond("⏳ توجد محاولة تسجيل X أخرى جارية. حاول بعد انتهائها.")
         return
 
+    # No await is allowed between this final maintenance check and reservation.
+    if _restarting:
+        _cancel_x_login(uid)
+        return
     # الحجز يحدث قبل أول await: يستطيع /cancel رؤية المحاولة حتى أثناء حذف السر.
     task = asyncio.current_task()
     _x_login_tasks[uid] = task
@@ -2397,7 +2592,8 @@ async def _save_x_login(event, st, password):
         _require_x_admin(uid)
         login_generation = xreader.invalidate()
         await event.respond(
-            "⏳ جاري تسجيل الدخول إلى X… إذا طُلب تحقق إضافي سأطلب الرمز هنا."
+            "⏳ أحاول تسجيل الدخول إلى X عبر متصفح معزول على Raspberry Pi… "
+            "إذا طلب X تحققاً إضافياً سأطلبه هنا."
         )
         _require_x_admin(uid)
         if not xreader.is_generation_current(login_generation):
@@ -2418,7 +2614,8 @@ async def _save_x_login(event, st, password):
             return
         # لا نحفظ كلمة المرور إلا بعد اكتمال كلمة المرور + التحديات + فحص الجلسة.
         try:
-            S.add_x_login(username, email, credentials["password"])
+            # الجلسة المحققة تكفي للقراءة؛ لا نحتفظ بكلمة مرور X بعد الدخول.
+            S.add_x_login(username, email, None)
         except OSError:
             # لا نترك cookie لا يمكن الوصول إليها بعد restart إذا فشل settings.
             discarded = xreader.discard_session(username)
@@ -2436,6 +2633,50 @@ async def _save_x_login(event, st, password):
         await event.respond("⌛ انتهت مهلة رمز X. ابدأ إضافة الحساب مجدداً.")
     except asyncio.CancelledError:
         return
+    except XBrowserCredentialsRejected:
+        await event.respond(
+            "❌ رفض X اسم المستخدم أو كلمة المرور. لم تُحفظ جلسة جديدة."
+        )
+    except XBrowserChallengeRejected:
+        await event.respond(
+            "❌ رفض X معلومات التحقق عدة مرات. أُغلقت جلسة المتصفح ولم يُحفظ شيء."
+        )
+    except XBrowserUnsupportedChallenge:
+        await event.respond(
+            "⚠️ طلب X CAPTCHA أو مفتاح أمان/تأكيداً غير مدعوم. لن يحاول البوت "
+            "تجاوزه؛ أكمله من موقع X الرسمي ثم أعد المحاولة."
+        )
+    except XBrowserUnavailable:
+        await event.respond(
+            "❌ متصفح تسجيل X غير متوفر أو تعذّر الوصول إلى صفحة X الآن. "
+            "أُغلقت المحاولة ولم تُحفظ جلسة جديدة."
+        )
+    except XBrowserCleanupError:
+        _x_browser_cleanup_unconfirmed = True
+        await event.respond(
+            "❌ تعذّر تأكيد إغلاق متصفح X بأمان، لذلك رُفضت الجلسة ولم تُحفظ. "
+            "أعد تشغيل الخدمة قبل محاولة جديدة."
+        )
+    except (XBrowserPageChanged, XBrowserSessionError):
+        await event.respond(
+            "⚠️ تغيّرت صفحة دخول X أو لم تُنشئ جلسة كاملة. لم تُرفض بياناتك "
+            "ولم تُحفظ جلسة جديدة."
+        )
+    except XSessionAccountMismatch:
+        await event.respond(
+            "❌ فتح X جلسة لحساب مختلف عن اسم المستخدم الذي أدخلته. أُغلقت الجلسة ولم يُحفظ شيء؛ "
+            "تحقق من اسم المستخدم ثم أعد المحاولة."
+        )
+    except XSessionVerificationError:
+        await event.respond(
+            "⚠️ نجح تسجيل المتصفح، لكن تعذّر التحقق من جلسة قارئ X الآن. لم تُحفظ الجلسة؛ "
+            "هذه ليست رسالة رفض لكلمة المرور، فحاول لاحقاً."
+        )
+    except (XTransactionCompatibilityError, XTransactionNetworkError):
+        await event.respond(
+            "⚠️ نجح مسار المتصفح، لكن تعذّر التحقق من جلسة القراءة مع X. "
+            "لم تُحفظ الجلسة؛ حاول لاحقاً."
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("فشل دخول X التفاعلي (%s)", type(e).__name__)
         await event.respond(
@@ -2767,7 +3008,7 @@ async def housekeeping():
 
 # ============ التشغيل ============
 async def main():
-    global _claim_code
+    global _claim_code, _restarting
     await bot.start(bot_token=S.get("bot_token"))
 
     # بعد ترقية نسخة قديمة، تصل لوحة الأزرار للأدمنين تلقائياً مرة واحدة؛
@@ -2807,13 +3048,18 @@ async def main():
     if not authed:
         log.info("الحساب غير مسجّل — سجّل الدخول من زر 🔐 داخل البوت.")
 
-    await asyncio.gather(
-        user.run_until_disconnected(),
-        bot.run_until_disconnected(),
-        x_poller(),
-        housekeeping(),
-        _offer_command_keyboards(keyboard_recipients),
-    )
+    try:
+        await asyncio.gather(
+            user.run_until_disconnected(),
+            bot.run_until_disconnected(),
+            x_poller(),
+            housekeeping(),
+            _offer_command_keyboards(keyboard_recipients),
+        )
+    finally:
+        _restarting = True
+        if not await _shutdown_x_logins():
+            log.critical("تعذّر تأكيد إغلاق متصفح X أثناء إيقاف البوت")
 
 
 if __name__ == "__main__":

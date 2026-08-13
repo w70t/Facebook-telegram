@@ -18,6 +18,10 @@ x_cookies*.json
 .x-cookies-*.tmp
 # atomic_write_json قد يترك هذا الملف بعد SIGKILL/انقطاع الكهرباء وفيه أسرار.
 .tmp-*.json
+# أي state لمتصفح X يعادل جلسة حساب كاملة؛ المسار الحالي لا ينشئه، وهذا
+# الاستثناء حزام إضافي يمنع رفعه لو أضيف تشخيص محلي مستقبلاً.
+playwright/.auth/
+playwright-browsers/
 
 downloads/
 __pycache__/

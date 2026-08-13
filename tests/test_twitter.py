@@ -4,9 +4,11 @@ import stat
 import sys
 import types
 
+import httpx
 import pytest
 
 import twitter
+import xbrowser
 from twitter import XReader, is_auth_error, is_newer
 
 
@@ -65,14 +67,35 @@ class FakeSettings:
         self.marked.append((username, failed))
 
 
+class FakeCookieJar:
+    def __init__(self, client):
+        self.client = client
+        self.values = {}
+
+    def clear(self):
+        self.values.clear()
+
+    def set(self, name, value, *, domain, path):
+        assert domain == ".x.com"
+        assert path == "/"
+        self.values[name] = value
+        self.client.cookies = dict(self.values)
+
+
 class FakeClient:
-    def __init__(self, events=None, verify_error=None, save_error=None):
+    def __init__(
+        self, events=None, verify_error=None, save_error=None,
+        authenticated_username="account",
+    ):
         self.events = events if events is not None else []
         self.verify_error = verify_error
         self.save_error = save_error
         self.loaded = []
         self.saved = []
         self.password_login_calls = 0
+        self.cookies = None
+        self.authenticated_username = authenticated_username
+        self.http = types.SimpleNamespace(cookies=FakeCookieJar(self))
 
     def load_cookies(self, path):
         self.events.append("load")
@@ -82,6 +105,7 @@ class FakeClient:
         self.events.append("verify")
         if self.verify_error:
             raise self.verify_error
+        return types.SimpleNamespace(screen_name=self.authenticated_username)
 
     async def login(self, **kwargs):
         self.password_login_calls += 1
@@ -94,6 +118,86 @@ class FakeClient:
             raise self.save_error
         with open(path, "w", encoding="utf-8") as cookie_file:
             cookie_file.write("{}")
+
+    def set_cookies(self, cookies, clear_cookies=False):
+        self.events.append("set")
+        self.cookies = dict(cookies)
+        assert clear_cookies is True
+
+    def get_cookies(self):
+        return dict(self.cookies or {})
+
+
+def test_new_client_installs_maintained_transaction_adapter(monkeypatch, tmp_path):
+    created = []
+
+    class Client:
+        def __init__(self, language):
+            self.language = language
+            self.client_transaction = object()
+            created.append(self)
+
+    monkeypatch.setitem(sys.modules, "twikit", types.SimpleNamespace(Client=Client))
+    reader = XReader(FakeSettings([]))
+
+    client = reader._new_client()
+
+    from xtransaction import TwikitTransactionAdapter
+
+    assert client is created[0]
+    assert client.language == "en-US"
+    assert isinstance(client.client_transaction, TwikitTransactionAdapter)
+
+
+def test_x_session_cookies_are_never_sent_to_non_x_hosts():
+    client = types.SimpleNamespace(
+        http=types.SimpleNamespace(cookies=httpx.Cookies())
+    )
+
+    XReader._set_x_cookies(client, {
+        "auth_token": "session-secret",
+        "ct0": "csrf-secret",
+    })
+
+    x_request = httpx.Request("GET", "https://x.com/i/api/test")
+    client.http.cookies.set_cookie_header(x_request)
+    assert "session-secret" in x_request.headers.get("cookie", "")
+
+    for url in (
+        "https://abs.twimg.com/responsive-web/client-web/app.js",
+        "https://evil.example/collect",
+    ):
+        request = httpx.Request("GET", url)
+        client.http.cookies.set_cookie_header(request)
+        assert "cookie" not in request.headers
+
+
+def test_real_twikit_duplicate_cookie_cleanup_preserves_x_domain_scope(
+    monkeypatch,
+):
+    from twikit import Client
+
+    reader = XReader(FakeSettings([]))
+    monkeypatch.setattr(
+        "xtransaction.TwikitTransactionAdapter",
+        lambda: types.SimpleNamespace(home_page_response=object()),
+    )
+    client = reader._new_client()
+    assert isinstance(client, Client)
+    reader._set_x_cookies(client, {
+        "auth_token": "session-secret",
+        "ct0": "csrf-secret",
+    })
+
+    client._remove_duplicate_ct0_cookie()
+
+    for url in (
+        "https://abs.twimg.com/responsive-web/client-web/app.js",
+        "https://evil.example/collect",
+    ):
+        request = httpx.Request("GET", url)
+        client.http.cookies.set_cookie_header(request)
+        assert "cookie" not in request.headers
 
 
 def _reader(monkeypatch, tmp_path, client, credentials=None):
@@ -142,7 +246,7 @@ def test_background_valid_cookies_are_verified(monkeypatch, tmp_path):
     reader, settings = _reader(monkeypatch, tmp_path, client)
 
     assert asyncio.run(reader.ensure_login()) is True
-    assert client.events == ["load", "verify"]
+    assert client.events == ["verify"]
     assert client.password_login_calls == 0
     assert settings.marked == []
     assert reader.client is client
@@ -202,7 +306,7 @@ def test_background_checks_next_cookie_account_without_password_login(
     reader = XReader(settings)
 
     def factory():
-        client = FakeClient()
+        client = FakeClient(authenticated_username="ready")
         clients.append(client)
         return client
 
@@ -227,23 +331,26 @@ def test_interactive_login_uses_challenge_callback_then_verifies_and_saves(
 
     received = {}
 
-    async def login_with_challenges(target, **kwargs):
+    async def obtain_cookies(credentials, challenge_handler, **kwargs):
         events.append("login")
-        received.update(kwargs)
-        assert target is client
+        received.update({
+            "credentials": dict(credentials),
+            "challenge_handler": challenge_handler,
+            **kwargs,
+        })
+        return {"auth_token": "auth", "ct0": "csrf"}
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
     cred = settings.credentials[0]
 
     assert asyncio.run(reader.login_interactive(cred, handler)) is True
     assert events == ["login", "verify", "save"]
     assert received == {
-        "auth_info_1": "account",
-        "auth_info_2": None,
-        "password": "top-secret",
+        "credentials": {
+            "username": "account",
+            "email": None,
+            "password": "top-secret",
+        },
         "challenge_handler": handler,
     }
     assert settings.marked == []
@@ -264,13 +371,10 @@ def test_interactive_challenge_timeout_does_not_mark_failed_or_save_secret(
     client = FakeClient()
     reader, settings = _reader(monkeypatch, tmp_path, client)
 
-    async def login_with_challenges(target, **kwargs):
+    async def obtain_cookies(*_args, **_kwargs):
         raise ChallengeTimeout("top-secret")
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
     with pytest.raises(ChallengeTimeout):
         asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
@@ -288,13 +392,10 @@ def test_interactive_raw_unauthorized_does_not_mark_credentials_failed(
     client = FakeClient()
     reader, settings = _reader(monkeypatch, tmp_path, client)
 
-    async def login_with_challenges(target, **kwargs):
+    async def obtain_cookies(*_args, **_kwargs):
         raise Unauthorized("bad credentials")
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
     with pytest.raises(Unauthorized):
         asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
@@ -302,41 +403,57 @@ def test_interactive_raw_unauthorized_does_not_mark_credentials_failed(
     assert not (tmp_path / "cookies.json").exists()
 
 
-def test_interactive_explicit_credentials_rejection_marks_failed(
+def test_interactive_explicit_credentials_rejection_preserves_stored_account(
     monkeypatch, tmp_path,
 ):
-    class XCredentialsRejected(Exception):
+    class XBrowserCredentialsRejected(Exception):
         pass
 
     client = FakeClient()
     reader, settings = _reader(monkeypatch, tmp_path, client)
+    cookie = tmp_path / "cookies.json"
+    cookie.write_text('{"old": "session"}', encoding="utf-8")
 
-    async def login_with_challenges(target, **kwargs):
-        raise XCredentialsRejected("redacted")
+    async def obtain_cookies(*_args, **_kwargs):
+        raise XBrowserCredentialsRejected("redacted")
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
-    with pytest.raises(XCredentialsRejected):
+    with pytest.raises(XBrowserCredentialsRejected):
         asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
-    assert settings.marked == [("account", True)]
+    assert settings.marked == []
+    assert cookie.read_text(encoding="utf-8") == '{"old": "session"}'
+
+
+def test_interactive_session_for_different_account_is_never_saved_or_activated(
+    monkeypatch, tmp_path,
+):
+    client = FakeClient(authenticated_username="different-account")
+    reader, settings = _reader(monkeypatch, tmp_path, client)
+
+    async def obtain_cookies(*_args, **_kwargs):
+        return {"auth_token": "auth", "ct0": "csrf"}
+
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
+
+    with pytest.raises(twitter.XSessionAccountMismatch):
+        asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
+    assert client.saved == []
+    assert reader.ready is False
+    assert settings.marked == []
+    assert not (tmp_path / "cookies.json").exists()
 
 
 def test_interactive_verify_failure_never_saves_cookies(monkeypatch, tmp_path):
     client = FakeClient(verify_error=ConnectionError("offline"))
     reader, settings = _reader(monkeypatch, tmp_path, client)
 
-    async def login_with_challenges(target, **kwargs):
-        return None
+    async def obtain_cookies(*_args, **_kwargs):
+        return {"auth_token": "auth", "ct0": "csrf"}
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(twitter.XSessionVerificationError):
         asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
     assert client.saved == []
     assert settings.marked == []
@@ -358,13 +475,10 @@ def test_interactive_save_failure_does_not_activate_session(monkeypatch, tmp_pat
     client.save_cookies = partial_save
     reader, settings = _reader(monkeypatch, tmp_path, client)
 
-    async def login_with_challenges(target, **kwargs):
-        return None
+    async def obtain_cookies(*_args, **_kwargs):
+        return {"auth_token": "auth", "ct0": "csrf"}
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
     with pytest.raises(OSError):
         asyncio.run(reader.login_interactive(settings.credentials[0], lambda x: x))
@@ -458,6 +572,7 @@ def test_discard_during_cookie_verify_cannot_reactivate_deleted_session(
         async def user(self):
             verify_started.set()
             await release_verify.wait()
+            return types.SimpleNamespace(screen_name="account")
 
     async def scenario():
         nonlocal verify_started, release_verify
@@ -490,14 +605,12 @@ def test_switch_during_interactive_login_cannot_save_or_replace_new_session(
     old_client = FakeClient()
     reader, settings = _reader(monkeypatch, tmp_path, old_client)
 
-    async def login_with_challenges(_target, **_kwargs):
+    async def obtain_cookies(*_args, **_kwargs):
         login_started.set()
         await release_login.wait()
+        return {"auth_token": "auth", "ct0": "csrf"}
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
     async def scenario():
         nonlocal login_started, release_login
@@ -524,7 +637,7 @@ def test_switch_during_interactive_login_cannot_save_or_replace_new_session(
 def test_stale_interactive_auth_error_cannot_disable_replacement_credential(
     monkeypatch, tmp_path,
 ):
-    class XCredentialsRejected(Exception):
+    class XBrowserCredentialsRejected(Exception):
         pass
 
     login_started = None
@@ -532,15 +645,12 @@ def test_stale_interactive_auth_error_cannot_disable_replacement_credential(
     old_client = FakeClient()
     reader, settings = _reader(monkeypatch, tmp_path, old_client)
 
-    async def login_with_challenges(_target, **_kwargs):
+    async def obtain_cookies(*_args, **_kwargs):
         login_started.set()
         await release_login.wait()
-        raise XCredentialsRejected("old attempt rejected")
+        raise XBrowserCredentialsRejected("old attempt rejected")
 
-    monkeypatch.setitem(
-        sys.modules, "xauth",
-        types.SimpleNamespace(login_with_challenges=login_with_challenges),
-    )
+    monkeypatch.setattr(xbrowser, "obtain_cookies", obtain_cookies)
 
     async def scenario():
         nonlocal login_started, release_login
@@ -555,7 +665,7 @@ def test_stale_interactive_auth_error_cannot_disable_replacement_credential(
         replacement_session = reader.capture_session()
         release_login.set()
 
-        with pytest.raises(XCredentialsRejected):
+        with pytest.raises(XBrowserCredentialsRejected):
             await task
         assert reader.capture_session() == replacement_session
         assert settings.marked == []

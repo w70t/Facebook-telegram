@@ -37,7 +37,7 @@ DEFAULTS = {
     "sources": [],               # قنوات تلغرام: [{"id","title","input"}]
     "download_dir": "downloads",
     # X (تويتر) — طريقة غير رسمية عبر twikit
-    "x_logins": [],              # حسابات الدخول: [{"username","email","password","failed"}]
+    "x_logins": [],              # جلسات الدخول: [{"username","email","password":null,"failed"}]
     "x_accounts": [],            # الحسابات المتابَعة: [{"screen_name","user_id","last_id"}]
     "x_poll_seconds": 120,
     "x_skip_replies": True,      # X: انسخ التغريدات فقط لا الردود
@@ -353,15 +353,28 @@ class Settings:
         return any(not lg.get("failed") for lg in self.x_logins())
 
     def add_x_login(self, username, email, password):
-        """يضيف حساب دخول ويجعله النشط (في المقدمة). يحدّث لو موجوداً."""
+        """يضيف جلسة دخول ويجعلها النشطة؛ كلمة المرور لا تُحفظ بعد التحقق."""
         with self._lock:
             logins = [
                 lg for lg in self.x_logins() if lg["username"].lower() != username.lower()
             ]
             logins.insert(0, {
-                "username": username, "email": email, "password": password, "failed": False,
+                "username": username, "email": email, "password": None, "failed": False,
             })
             self._replace("x_logins", logins)
+
+    def scrub_x_login_passwords(self):
+        """يحذف كلمات مرور X القديمة من primary والنسخة الاحتياطية ذرّياً."""
+        with self._lock:
+            logins = self.x_logins()
+            changed = 0
+            for login in logins:
+                if login.get("password") is not None:
+                    login["password"] = None
+                    changed += 1
+            if changed:
+                self._replace("x_logins", logins)
+            return changed
 
     def remove_x_login(self, username):
         with self._lock:

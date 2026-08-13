@@ -9,6 +9,8 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/Facebook-telegram
 ExecStart=/home/pi/Facebook-telegram/venv/bin/python main.py
+# ثبّت Chromium مسبقاً في هذا المسار بنفس إصدار Playwright المثبت في venv.
+Environment=PLAYWRIGHT_BROWSERS_PATH=/home/pi/Facebook-telegram/playwright-browsers
 # always: يضمن إعادة التشغيل بعد زر "🔄 تحديث من GitHub"
 Restart=always
 RestartSec=5

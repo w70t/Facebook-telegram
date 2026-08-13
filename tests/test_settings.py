@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -425,8 +426,31 @@ def test_nested_accessors_return_copies(settings):
     logins[0]["password"] = "changed-outside"
     accounts[0]["last_id"] = "999"
 
-    assert settings.x_logins()[0]["password"] == "secret"
+    assert settings.x_logins()[0]["password"] is None
     assert settings.x_accounts()[0]["last_id"] == "1"
+
+
+def test_scrub_x_login_passwords_removes_legacy_secrets_from_primary_and_backup(
+    settings,
+):
+    # Simulate a record written by the pre-browser-login release.
+    candidate = dict(settings.data)
+    candidate["x_logins"] = [{
+        "username": "legacy",
+        "email": None,
+        "password": "old-plaintext-secret",
+        "failed": False,
+    }]
+    settings._commit(candidate)
+
+    assert settings.scrub_x_login_passwords() == 1
+    assert settings.x_logins()[0]["password"] is None
+
+    primary = Path(settings.path).read_text(encoding="utf-8")
+    backup = Path(settings.path + ".bak").read_text(encoding="utf-8")
+    assert "old-plaintext-secret" not in primary
+    assert "old-plaintext-secret" not in backup
+    assert settings.scrub_x_login_passwords() == 0
 
 
 def test_set_many_is_atomic(settings, monkeypatch):

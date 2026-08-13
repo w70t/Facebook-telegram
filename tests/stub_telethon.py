@@ -75,6 +75,24 @@ class TelegramClient:
             return fn
         return decorator
 
+    def list_event_handlers(self):
+        return [(callback, event) for event, callback in self.handlers]
+
+    def remove_event_handler(self, callback, event=None):
+        before = len(self.handlers)
+        self.handlers = [
+            (builder, handler)
+            for builder, handler in self.handlers
+            if not (
+                handler is callback
+                and (event is None or builder is event)
+            )
+        ]
+        return before - len(self.handlers)
+
+    def add_event_handler(self, callback, event=None):
+        self.handlers.append((event, callback))
+
     def is_connected(self):
         return False
 

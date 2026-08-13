@@ -57,6 +57,12 @@ jobs:
             git check-ignore -q "$f" || { echo "❌ $f غير مستثنى في .gitignore"; exit 1; }
             rm -f "$f"
           done
+          mkdir -p playwright/.auth playwright-browsers
+          touch playwright/.auth/state.json playwright-browsers/browser-secret
+          for f in playwright/.auth/state.json playwright-browsers/browser-secret; do
+            git check-ignore -q "$f" || { echo "❌ $f غير مستثنى في .gitignore"; exit 1; }
+          done
+          rm -rf playwright playwright-browsers
           echo "✅ كل ملفات الأسرار مستثناة"
 
   test-windows:
