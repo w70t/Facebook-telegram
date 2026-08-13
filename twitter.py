@@ -506,7 +506,15 @@ class XReader:
             # عملية أحدث الجلسة/الحساب؛ وإلا قد يحرق خطأ متأخر الحساب الصحيح.
             if self.is_generation_current(generation):
                 self._mark_failed_if_auth(username, e)
-            log.warning("فشل تسجيل X التفاعلي (%s)", type(e).__name__)
+            reason = (
+                getattr(e, "reason", None)
+                if type(e).__name__ == "XBrowserPageChanged"
+                else None
+            )
+            if reason:
+                log.warning("فشل تسجيل X التفاعلي (%s:%s)", type(e).__name__, reason)
+            else:
+                log.warning("فشل تسجيل X التفاعلي (%s)", type(e).__name__)
             raise
         finally:
             password = None

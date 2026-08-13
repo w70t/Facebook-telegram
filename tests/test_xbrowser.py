@@ -167,6 +167,7 @@ class FakePage:
         transition_delay=0,
         url_changes_before_dom=False,
         form_submit_count=1,
+        initial_ready_polls=0,
     ):
         self.state = "new"
         self.stages = list(stages)
@@ -175,6 +176,7 @@ class FakePage:
         self.evil_redirect = evil_redirect
         self.hang_goto = hang_goto
         self.initial_state = initial_state
+        self.initial_ready_polls = initial_ready_polls
         self.url = xbrowser.LOGIN_URL
         self.fills = []
         self.clicks = []
@@ -211,7 +213,7 @@ class FakePage:
         self.goto_started.set()
         if self.hang_goto:
             await asyncio.Event().wait()
-        self.state = self.initial_state
+        self.state = "loading" if self.initial_ready_polls else self.initial_state
         if self.evil_redirect:
             self.url = "https://evil.example/login"
         return FakeResponse()
@@ -224,6 +226,11 @@ class FakePage:
         self.route_handler = handler
 
     async def wait_for_timeout(self, _milliseconds):
+        if self.initial_ready_polls:
+            self.initial_ready_polls -= 1
+            if not self.initial_ready_polls:
+                self.dom_generation += 1
+                self.state = self.initial_state
         await asyncio.sleep(min(_milliseconds / 1000, 0.01))
 
     async def close(self):
@@ -333,6 +340,7 @@ def fake_runtime(
     fail_browser_close=False,
     fail_manager_stop=False,
     form_submit_count=1,
+    initial_ready_polls=0,
 ):
     events = []
     page = FakePage(
@@ -345,6 +353,7 @@ def fake_runtime(
         transition_delay=transition_delay,
         url_changes_before_dom=url_changes_before_dom,
         form_submit_count=form_submit_count,
+        initial_ready_polls=initial_ready_polls,
     )
     context = FakeContext(page, events, cookies=cookies, fail_close=fail_context_close)
     browser = FakeBrowser(context, events, fail_close=fail_browser_close)
@@ -416,6 +425,55 @@ def test_browser_login_without_challenge_returns_memory_cookies_and_closes_all()
     assert browser.launch_kwargs == {"headless": True, "chromium_sandbox": True}
     assert browser.context_kwargs["accept_downloads"] is False
     assert events == ["page.close", "context.close", "browser.close", "manager.stop"]
+
+
+def test_browser_waits_for_lazy_initial_form_before_filling_any_value():
+    factory, page, _browser, events = fake_runtime(
+        ["password", "success"], initial_ready_polls=4,
+    )
+
+    result = run_login(factory, lambda *_args: None)
+
+    assert result["auth_token"] == "auth-value"
+    assert page.fills == [
+        ("username", "reader"),
+        ("password", "account-password"),
+    ]
+    assert events[-1] == "manager.stop"
+
+
+def test_initial_form_readiness_timeout_fails_without_filling_or_clicking():
+    factory, page, _browser, events = fake_runtime(
+        [], initial_ready_polls=100,
+    )
+    context = factory.starter.manager.chromium.browser.context
+
+    with pytest.raises(xbrowser.XBrowserPageChanged) as caught:
+        asyncio.run(xbrowser._wait_for_initial_login_stage(
+            page, context, timeout_ms=5,
+        ))
+
+    assert caught.value.reason == "initial_controls_timeout"
+    assert page.fills == []
+    assert page.clicks == []
+    assert events == []
+
+
+def test_initial_form_readiness_honors_cancellation_before_any_secret_fill():
+    factory, page, _browser, _events = fake_runtime(
+        [], initial_ready_polls=100,
+    )
+    context = factory.starter.manager.chromium.browser.context
+    cancel = asyncio.Event()
+    cancel.set()
+
+    with pytest.raises(xbrowser.XBrowserCancelled):
+        asyncio.run(xbrowser._wait_for_initial_login_stage(
+            page, context, cancel_event=cancel,
+        ))
+
+    assert page.fills == []
+    assert page.clicks == []
 
 
 def test_current_static_full_form_fills_both_fields_then_submits_once():
