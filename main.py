@@ -21,7 +21,7 @@ import time
 from urllib.parse import urljoin, urlsplit
 
 import requests
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, helpers, types
 from telethon.errors import (
     FloodWaitError,
     MessageNotModifiedError,
@@ -57,9 +57,11 @@ from util import (
     TEXT_LIMIT,
     human_size,
     media_summary,
+    clean_source_text,
     normalize_phone,
     preview,
     review_body,
+    truncate,
 )
 
 logging.basicConfig(
@@ -939,6 +941,116 @@ async def _download_tg_media(msg):
     return {"path": path, "type": kind}
 
 
+def _is_telegram_url(value):
+    """يفحص وجهة رابط entity المخفية دون قبول subdomains أو userinfo."""
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.scheme.lower() == "tg":
+        return (parsed.hostname or "").lower() in {
+            "resolve", "join", "privatepost",
+        }
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and (parsed.hostname or "").lower() in {
+            "t.me", "www.t.me", "telegram.me", "www.telegram.me",
+            "telegram.dog", "www.telegram.dog",
+        }
+        and port in (None, 80, 443)
+    )
+
+
+def _telegram_entity_span(text, entity):
+    """يحوّل offset/length بوحدات UTF-16 إلى موضع Python أو يعيد None."""
+    try:
+        surrogated = helpers.add_surrogate(text or "")
+        start = getattr(entity, "offset", -1)
+        length = getattr(entity, "length", -1)
+        if (
+            not isinstance(start, int) or not isinstance(length, int)
+            or start < 0 or length <= 0 or start + length > len(surrogated)
+        ):
+            return None
+        py_start = len(helpers.del_surrogate(surrogated[:start]))
+        py_end = len(helpers.del_surrogate(surrogated[:start + length]))
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if not 0 <= py_start < py_end <= len(text or ""):
+        return None
+    return py_start, py_end
+
+
+def _telegram_hidden_link_spans(msg):
+    """مواضع الروابط الظاهرة/المخفية التي تقود إلى Telegram."""
+    if msg is None:
+        return []
+    text = getattr(msg, "message", None) or ""
+    spans = []
+    for entity in getattr(msg, "entities", None) or ():
+        span = _telegram_entity_span(text, entity)
+        if span is None:
+            continue
+        if isinstance(entity, types.MessageEntityTextUrl):
+            target = getattr(entity, "url", None)
+        elif isinstance(entity, types.MessageEntityUrl):
+            target = text[span[0]:span[1]]
+        else:
+            continue
+        if _is_telegram_url(target):
+            spans.append(span)
+    return spans
+
+
+def _message_filter_corpus(msg):
+    """نص البحث الأصلي، شاملاً وجهات الروابط المخفية ومعاينة الويب."""
+    if msg is None:
+        return ""
+    text = getattr(msg, "message", None) or ""
+    parts = [text]
+    for entity in getattr(msg, "entities", None) or ():
+        if isinstance(entity, types.MessageEntityTextUrl):
+            target = getattr(entity, "url", None)
+            if isinstance(target, str) and target:
+                parts.append(target)
+    webpage = getattr(getattr(msg, "media", None), "webpage", None)
+    for name in ("url", "display_url"):
+        value = getattr(webpage, name, None)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _clean_message_text(msg):
+    if msg is None:
+        return ""
+    return clean_source_text(
+        getattr(msg, "message", None) or "",
+        S.cleanup_phrases(),
+        _telegram_hidden_link_spans(msg),
+    )
+
+
+def _has_playable_media(media):
+    return any(
+        isinstance(item, dict) and item.get("type") in ("photo", "video")
+        for item in media or ()
+    )
+
+
+def _is_telegram_pending(item):
+    """منشورات Telegram المحلية لا تحمل origin؛ X القديم كان يحمل رابطاً."""
+    return isinstance(item, dict) and not item.get("origin")
+
+
 async def _queue_for_review(text, media, origin="", on_persisted=None):
     """
     يضيف منشوراً للمخزن ويرسله للمراجعة. يرجع item_id أو None.
@@ -1069,9 +1181,12 @@ async def on_source_message(event):
         return                      # جزء من ألبوم — يتكفّل به on_source_album
 
     msg = event.message
-    text = msg.message or ""
-    if S.is_filtered(text):
+    if S.is_filtered(_message_filter_corpus(msg)):
         log.info("تجاهل منشور تلغرام (فلتر كلمات)")
+        return
+    text = _clean_message_text(msg)
+    if not text and _media_kind(msg) not in ("photo", "video"):
+        log.info("تجاهل منشور تلغرام بعد تنظيف نص خالٍ من محتوى قابل للنشر")
         return
 
     media = []
@@ -1079,6 +1194,10 @@ async def on_source_message(event):
         item = await _download_tg_media(msg)
         if item:
             media.append(item)
+
+    if not text and not _has_playable_media(media):
+        log.info("تجاهل منشور تلغرام بعد تنظيف نص خالٍ من محتوى قابل للنشر")
+        return
 
     log.info("منشور جديد من %s (%s)", event.chat_id, media_summary(media) or "نص")
     await _queue_for_review(text, media)
@@ -1093,16 +1212,30 @@ async def on_source_album(event):
     if event.chat_id not in source_ids or not S.get("review_chat_id"):
         return
 
-    text = next((m.message for m in event.messages if m.message), "") or ""
-    if S.is_filtered(text):
+    if any(S.is_filtered(_message_filter_corpus(m)) for m in event.messages):
         log.info("تجاهل ألبوم تلغرام (فلتر كلمات)")
+        return
+    caption_messages = [m for m in event.messages if m.message]
+    caption_message = caption_messages[0] if caption_messages else None
+    text = _clean_message_text(caption_message)
+    candidates = list(event.messages[:MAX_ALBUM_PHOTOS])
+    if not text and not any(
+        _media_kind(message) in ("photo", "video") for message in candidates
+    ):
+        log.info("تجاهل ألبوم تلغرام بعد تنظيف نص خالٍ من محتوى قابل للنشر")
         return
 
     media = []
-    for msg in event.messages[:MAX_ALBUM_PHOTOS]:
+    for msg in candidates:
+        if not text and _media_kind(msg) not in ("photo", "video"):
+            continue
         item = await _download_tg_media(msg)
         if item:
             media.append(item)
+
+    if not text and not _has_playable_media(media):
+        log.info("تجاهل ألبوم تلغرام بعد تنظيف نص خالٍ من محتوى قابل للنشر")
+        return
 
     log.info("ألبوم جديد من %s (%s)", event.chat_id, media_summary(media) or "نص")
     await _queue_for_review(text, media)
@@ -1117,6 +1250,11 @@ def _build_buttons(item_id, item):
     rows.append(
         [
             Button.inline("✏️ تعديل النص", f"edit:{item_id}".encode()),
+            Button.inline("🧹 تنظيف النص", f"clean:{item_id}".encode()),
+        ]
+    )
+    rows.append(
+        [
             Button.inline("❌ تجاهل", f"skip:{item_id}".encode()),
         ]
     )
@@ -1156,6 +1294,7 @@ async def _send_for_review(item_id, refresh=False):
                 review["msg"],
                 review_body(item["text"], header, limit),
                 buttons=buttons,
+                link_preview=False,
             )
             return
         except MessageNotModifiedError:
@@ -1169,6 +1308,7 @@ async def _send_for_review(item_id, refresh=False):
         msg = await _tg_call(
             bot.send_message, chat,
             review_body(item["text"], header, TEXT_LIMIT), buttons=buttons,
+            link_preview=False,
         )
         has_media = False
     elif len(files) == 1:
@@ -1182,10 +1322,45 @@ async def _send_for_review(item_id, refresh=False):
         msg = await _tg_call(
             bot.send_message, chat,
             review_body(item["text"], header, TEXT_LIMIT), buttons=buttons,
+            link_preview=False,
         )
         has_media = False
 
     PENDING.update(item_id, review={"chat": chat, "msg": msg.id, "has_media": has_media})
+
+
+async def _sanitize_pending_reviews():
+    """ينظف النصوص القديمة ويحدّث رسالة المراجعة نفسها عند بدء التشغيل."""
+    changed = 0
+    for item_id, snapshot in list(PENDING.items.items()):
+        if not _is_telegram_pending(snapshot):
+            continue
+        if item_id in _publishing or snapshot.get("publish_state") in {
+            "publishing", "published",
+        }:
+            continue
+        original = snapshot.get("text") or ""
+        cleaned = clean_source_text(original, S.cleanup_phrases())
+        if cleaned == original:
+            continue
+        try:
+            updated = PENDING.update(item_id, text=cleaned)
+        except OSError as e:
+            log.warning("تعذّر تنظيف منشور معلّق قديم %s: %s", item_id, e)
+            continue
+        if not updated:
+            continue
+        changed += 1
+        if (updated.get("review") or {}).get("msg"):
+            try:
+                await _send_for_review(item_id, refresh=True)
+            except Exception as e:  # noqa: BLE001
+                # النص المثبّت على القرص هو الذي سيُنشر؛ تعطل تحديث Telegram
+                # لا يعيد الرابط حتى لو بقيت المعاينة القديمة ظاهرة مؤقتاً.
+                log.warning("نُظّف المنشور %s لكن تعذّر تحديث مراجعته: %s", item_id, e)
+    if changed:
+        log.info("نُظّفت نصوص %d منشور معلّق", changed)
+    return changed
 
 
 # ============ لوحة التحكم (الأزرار) ============
@@ -2582,15 +2757,26 @@ async def _add_x_account(event, raw):
 # ============ فلترة الكلمات ============
 async def _show_filter(event):
     words = S.filter_words()
-    text = "🚫 كلمات الفلترة (أي منشور يحتويها يُتجاهل):\n" + (
+    phrases = S.cleanup_phrases()
+    text = "⛔ كلمات منع المنشور (أي منشور يحتويها يُتجاهل كاملاً):\n" + (
         "\n".join(f"• {w}" for w in words) if words else "(لا توجد كلمات)"
     )
-    text += "\n\nتُطبّق على منشورات تلغرام."
+    text += "\n\n🧹 عبارات تُحذف من النص ويُحفظ باقي المنشور:\n" + (
+        "\n".join(f"• {phrase}" for phrase in phrases)
+        if phrases else "(لا توجد عبارات)"
+    )
+    text += "\n\n🔗 روابط قنوات Telegram تُحذف تلقائياً."
     await event.respond(
-        text,
+        truncate(text, TEXT_LIMIT),
         buttons=[
-            [Button.inline("➕ إضافة كلمة", b"flt:add")],
-            [Button.inline("➖ حذف كلمة", b"flt:del")],
+            [
+                Button.inline("➕ كلمة منع", b"flt:add"),
+                Button.inline("➖ كلمة منع", b"flt:del"),
+            ],
+            [
+                Button.inline("➕ عبارة تنظيف", b"flt:clean_add"),
+                Button.inline("➖ عبارة تنظيف", b"flt:clean_del"),
+            ],
         ],
     )
 
@@ -2609,6 +2795,14 @@ async def on_flt(event):
     elif action == "del":
         _set_state(event.sender_id, {"action": "del_filter"})
         await event.respond("أرسل الكلمة المراد حذفها:")
+    elif action == "clean_add":
+        _set_state(event.sender_id, {"action": "add_cleanup_phrase"})
+        await event.respond(
+            "أرسل العبارة التي تريد حذفها من النص مع إبقاء بقية المنشور:"
+        )
+    elif action == "clean_del":
+        _set_state(event.sender_id, {"action": "del_cleanup_phrase"})
+        await event.respond("أرسل عبارة التنظيف المراد حذفها من القائمة:")
     await event.answer()
 
 
@@ -2836,7 +3030,7 @@ def _publish_block_message(item_id, item=None):
     return None
 
 
-@bot.on(events.CallbackQuery(pattern=rb"^(pub|pubtext|edit|skip):"))
+@bot.on(events.CallbackQuery(pattern=rb"^(pub|pubtext|edit|clean|skip):"))
 async def on_post_action(event):
     if not S.is_admin(event.sender_id):
         await event.answer("غير مصرّح لك.", alert=True)
@@ -2864,6 +3058,29 @@ async def on_post_action(event):
         _set_state(event.sender_id, {"action": "edit_text", "item_id": item_id})
         await event.respond("✏️ أرسل الآن النص الجديد.")
         await event.answer()
+    elif action == "clean":
+        cleaned = clean_source_text(item.get("text") or "", S.cleanup_phrases())
+        if cleaned == (item.get("text") or ""):
+            await event.answer("✅ النص نظيف بالفعل.", alert=True)
+            return
+        if not cleaned and not _has_playable_media(item.get("media")):
+            try:
+                PENDING.remove(item_id)
+            except OSError as e:
+                await event.respond(f"❌ تعذّر حفظ التنظيف؛ لم أغيّر المنشور:\n{e}")
+                return
+            await event.edit("🧹 حُذف النص الإعلاني ولم يبق محتوى قابل للنشر؛ أُغلق الطلب.")
+            return
+        try:
+            updated = PENDING.update(item_id, text=cleaned)
+        except OSError as e:
+            await event.respond(f"❌ تعذّر حفظ النص المنظّف؛ لم أنشر شيئاً:\n{e}")
+            return
+        if not updated:
+            await event.answer("انتهت صلاحية هذا المنشور.", alert=True)
+            return
+        await _send_for_review(item_id, refresh=True)
+        await event.answer("🧹 تم تنظيف النص.")
     elif action == "skip":
         PENDING.remove(item_id)
         await event.edit("🚫 تم التجاهل.")
@@ -2941,7 +3158,27 @@ async def _publish(event, item_id, include_media):
         await event.answer("المنشور لم يعد متاحاً.", alert=True)
         return
 
-    text = item["text"]
+    # دفاع أخير: لو أضيفت كلمة منع بعد وصول المنشور إلى المراجعة، لا نسمح
+    # بضغطة زر قديمة أن تتجاوز السياسة وتتصل بـFacebook.
+    if _is_telegram_pending(item) and S.is_filtered(item.get("text") or ""):
+        await event.answer(
+            "⛔ مُنع النشر لأن النص يحتوي كلمة من قائمة منع المنشورات.",
+            alert=True,
+        )
+        return
+
+    text = item.get("text") or ""
+    if _is_telegram_pending(item):
+        text = clean_source_text(text, S.cleanup_phrases())
+    if text != (item.get("text") or ""):
+        try:
+            item = PENDING.update(item_id, text=text)
+        except OSError as e:
+            await event.respond(f"❌ تعذّر حفظ تنظيف النص؛ لم أتصل بفيسبوك.\n{e}")
+            return
+        if not item:
+            await event.answer("المنشور لم يعد متاحاً.", alert=True)
+            return
     photos = PENDING.media_paths(item_id, ("photo",))
     videos = PENDING.media_paths(item_id, ("video",))
     if not text.strip() and not (include_media and (photos or videos)):
@@ -3317,6 +3554,32 @@ async def on_text(event):
         removed = S.remove_filter_word(text)
         _clear_state(uid)
         await event.respond("🗑️ حُذفت الكلمة." if removed else "لم أجد الكلمة.")
+    elif action == "add_cleanup_phrase":
+        try:
+            added = S.add_cleanup_phrase(event.text)
+        except ValueError:
+            await event.respond(
+                "❌ العبارة غير صالحة. استخدم سطراً واحداً من 1 إلى 200 حرف."
+            )
+            return
+        _clear_state(uid)
+        changed = await _sanitize_pending_reviews() if added else 0
+        await event.respond(
+            (
+                f"✅ أُضيفت عبارة التنظيف، ونُظّف {changed} منشور معلّق."
+                if added else "ℹ️ موجودة مسبقاً."
+            )
+        )
+    elif action == "del_cleanup_phrase":
+        try:
+            removed = S.remove_cleanup_phrase(event.text)
+        except ValueError:
+            await event.respond("❌ أرسل عبارة صالحة من سطر واحد.")
+            return
+        _clear_state(uid)
+        await event.respond(
+            "🗑️ حُذفت عبارة التنظيف." if removed else "لم أجد العبارة."
+        )
     elif action == "add_admin":
         if text.isdigit():
             added_uid = int(text)
@@ -3718,16 +3981,40 @@ async def _switch_x_login(event, text):
 
 async def _apply_edit(event, st):
     item_id = st["item_id"]
-    _clear_state(event.sender_id)
     item = PENDING.get(item_id)
     blocked = _publish_block_message(item_id, item)
     if blocked:
+        _clear_state(event.sender_id)
         await event.respond(blocked)
         return
     if not item:
+        _clear_state(event.sender_id)
         await event.respond("المنشور لم يعد متاحاً.")
         return
-    PENDING.update(item_id, text=event.text)
+    if _is_telegram_pending(item) and S.is_filtered(event.text or ""):
+        _set_state(event.sender_id, {"action": "edit_text", "item_id": item_id})
+        await event.respond(
+            "⛔ هذا النص يحتوي كلمة من قائمة منع المنشورات. عدّله ثم أرسله من جديد."
+        )
+        return
+    cleaned = event.text or ""
+    if _is_telegram_pending(item):
+        cleaned = clean_source_text(cleaned, S.cleanup_phrases())
+    if not cleaned and not _has_playable_media(item.get("media")):
+        _set_state(event.sender_id, {"action": "edit_text", "item_id": item_id})
+        await event.respond("❌ لا يمكن حفظ منشور بلا نص ولا صورة أو فيديو.")
+        return
+    try:
+        updated = PENDING.update(item_id, text=cleaned)
+    except OSError as e:
+        _set_state(event.sender_id, {"action": "edit_text", "item_id": item_id})
+        await event.respond(f"❌ تعذّر حفظ النص؛ أرسله مجدداً لاحقاً:\n{e}")
+        return
+    if not updated:
+        _clear_state(event.sender_id)
+        await event.respond("المنشور لم يعد متاحاً.")
+        return
+    _clear_state(event.sender_id)
     await _send_for_review(item_id, refresh=True)
     await event.respond("✅ تم تحديث النص في رسالة المراجعة.")
 
@@ -4042,6 +4329,7 @@ async def main():
 
     _rebuild_ids()
     # استعد outbox والحالات المؤكدة/غير المحسومة قبل أي تنظيف بالـTTL.
+    await _sanitize_pending_reviews()
     await _replay_unreviewed()
     PENDING.purge_expired()
     PENDING.sweep_orphans()

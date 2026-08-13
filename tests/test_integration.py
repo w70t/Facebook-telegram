@@ -150,8 +150,9 @@ class FakeBot:
         self.sent = []
         self.edits = []
 
-    async def send_message(self, chat, text, buttons=None):
+    async def send_message(self, chat, text, buttons=None, **kwargs):
         msg = Sent("message", chat, text, buttons=buttons)
+        msg.kwargs = kwargs
         self.sent.append(msg)
         return msg
 
@@ -160,9 +161,9 @@ class FakeBot:
         self.sent.append(msg)
         return msg
 
-    async def edit_message(self, chat, message_id, text, buttons=None):
+    async def edit_message(self, chat, message_id, text, buttons=None, **kwargs):
         self.edits.append({"chat": chat, "msg": message_id, "text": text,
-                           "buttons": buttons})
+                           "buttons": buttons, **kwargs})
         return Sent("edit", chat, text, buttons=buttons)
 
 

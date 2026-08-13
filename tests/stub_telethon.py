@@ -6,6 +6,7 @@ telethon تحتاج امتدادات تُبنى أثناء التثبيت وقد
 فحصه بالـ lint.
 """
 import sys
+import struct
 import types
 
 
@@ -120,6 +121,33 @@ class SessionPasswordNeededError(Exception):
     pass
 
 
+class MessageEntityTextUrl:
+    def __init__(self, offset, length, url):
+        self.offset = offset
+        self.length = length
+        self.url = url
+
+
+class MessageEntityUrl:
+    def __init__(self, offset, length):
+        self.offset = offset
+        self.length = length
+
+
+def add_surrogate(text):
+    """Test equivalent of Telethon's UTF-16 surrogate expansion helper."""
+    return "".join(
+        "".join(chr(unit) for unit in struct.unpack("<HH", char.encode("utf-16le")))
+        if "\U00010000" <= char <= "\U0010ffff"
+        else char
+        for char in text
+    )
+
+
+def del_surrogate(text):
+    return text.encode("utf-16le", "surrogatepass").decode("utf-16le")
+
+
 def get_peer_id(entity):
     return getattr(entity, "id", 0)
 
@@ -129,6 +157,9 @@ def install():
     telethon = types.ModuleType("telethon")
     events = types.ModuleType("telethon.events")
     errors = types.ModuleType("telethon.errors")
+    helpers = types.ModuleType("telethon.helpers")
+    tl = types.ModuleType("telethon.tl")
+    tl_types = types.ModuleType("telethon.tl.types")
     utils = types.ModuleType("telethon.utils")
 
     events.NewMessage = NewMessage
@@ -140,15 +171,28 @@ def install():
     errors.MessageNotModifiedError = MessageNotModifiedError
     errors.SessionPasswordNeededError = SessionPasswordNeededError
 
+    helpers.add_surrogate = add_surrogate
+    helpers.del_surrogate = del_surrogate
+
+    tl_types.MessageEntityTextUrl = MessageEntityTextUrl
+    tl_types.MessageEntityUrl = MessageEntityUrl
+    tl.types = tl_types
+
     utils.get_peer_id = get_peer_id
 
     telethon.Button = Button
     telethon.TelegramClient = TelegramClient
     telethon.events = events
     telethon.errors = errors
+    telethon.helpers = helpers
+    telethon.types = tl_types
+    telethon.tl = tl
     telethon.utils = utils
 
     sys.modules["telethon"] = telethon
     sys.modules["telethon.events"] = events
     sys.modules["telethon.errors"] = errors
+    sys.modules["telethon.helpers"] = helpers
+    sys.modules["telethon.tl"] = tl
+    sys.modules["telethon.tl.types"] = tl_types
     sys.modules["telethon.utils"] = utils
