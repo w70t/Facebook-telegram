@@ -8,6 +8,7 @@
 import asyncio
 import glob
 import hashlib
+import hmac
 import logging
 import os
 import random
@@ -49,6 +50,7 @@ from xbrowser import (
     XBrowserUnsupportedChallenge,
 )
 from xtransaction import XTransactionCompatibilityError, XTransactionNetworkError
+from jsonio import atomic_write_json, read_json
 from util import (
     CAPTION_LIMIT,
     TEXT_LIMIT,
@@ -181,6 +183,15 @@ _x_cooldown_notified_memory: set[str] = set()
 _x_cooldown_lock = None
 _x_cooldown_lock_loop = None
 _x_cooldown_runtime = None         # deadline monotonic للجيل الحالي
+# العدّاد القديم أعلاه بلا هوية حساب، لذلك يبقى للإشعار فقط ولا يمنع حساباً
+# جديداً. العدادات الجديدة منفصلة ببصمة HMAC ولا تحفظ اسم مستخدم X.
+_x_account_cooldown_tasks: dict[str, asyncio.Task] = {}
+_x_account_cooldown_memory: dict[str, dict] = {}
+_x_account_cooldown_runtime: dict[str, dict] = {}
+_x_account_cooldown_notifying: set[tuple[str, str]] = set()
+_x_account_cooldown_notified_memory: set[tuple[str, str]] = set()
+_x_cooldown_hmac_key = None
+_x_cooldown_key_error = False
 _x_browser_cleanup_unconfirmed = False
 _x_secret_delete_unconfirmed = False
 _restarting = False
@@ -208,6 +219,110 @@ X_SETUP_ACTIONS = {
 }
 
 xreader = XReader(S)
+
+X_COOLDOWN_KEY_FILE = os.path.join(STATE_DIR, "x_cooldown_key.json")
+_X_COOLDOWN_KEY_CONTEXT = b"tg2fb/x-cooldown/v1\0"
+_X_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+_XLOGIN_SAFE_STAGES = {
+    "login_started",
+    "challenge_requested_alternate_identifier",
+    "challenge_requested_two_factor",
+    "challenge_requested_verification_code",
+    "challenge_received_alternate_identifier",
+    "challenge_received_two_factor",
+    "challenge_received_verification_code",
+    "session_verified",
+    "rate_limited",
+    "attempt_finished",
+}
+
+
+def _log_xlogin_stage(stage):
+    """يسجل مرحلة allowlisted فقط؛ لا اسم حساب ولا سر ولا prompt من X."""
+    if stage in _XLOGIN_SAFE_STAGES:
+        log.info("XLOGIN_STAGE %s", stage)
+
+
+def _canonical_x_username(value):
+    if not isinstance(value, str):
+        return None
+    username = value.strip()
+    if username.startswith("@"):
+        username = username[1:]
+    if not _X_USERNAME_RE.fullmatch(username):
+        return None
+    return username.casefold()
+
+
+def _load_x_cooldown_hmac_key():
+    """مفتاح منفصل 0600؛ لا يُطبع ولا يُحفظ داخل settings.json."""
+    global _x_cooldown_hmac_key, _x_cooldown_key_error
+    if _x_cooldown_hmac_key is not None:
+        return _x_cooldown_hmac_key
+    if _x_cooldown_key_error:
+        return None
+    try:
+        if os.path.lexists(X_COOLDOWN_KEY_FILE):
+            info = os.stat(X_COOLDOWN_KEY_FILE, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("cooldown key is not a regular file")
+            payload = read_json(X_COOLDOWN_KEY_FILE)
+            if not isinstance(payload, dict):
+                raise OSError("invalid cooldown key document")
+            raw = bytes.fromhex(payload.get("key", ""))
+            if payload.get("version") != 1 or len(raw) != 32:
+                raise OSError("invalid cooldown key")
+        else:
+            # إذا وُجدت عدادات scoped وفُقد مفتاحها، توليد مفتاح جديد سيفتحها
+            # خطأً. نفشل مغلقاً بدلاً من كسر الربط بصمت.
+            existing = getattr(S, "x_login_cooldowns", lambda: {})()
+            if existing:
+                raise OSError("cooldown key missing while scoped records exist")
+            raw = secrets.token_bytes(32)
+            atomic_write_json(
+                X_COOLDOWN_KEY_FILE,
+                {"version": 1, "key": raw.hex()},
+                mode=0o600,
+            )
+        try:
+            os.chmod(X_COOLDOWN_KEY_FILE, 0o600)
+        except OSError as exc:
+            raise OSError("could not protect cooldown key") from exc
+        if os.name == "posix":
+            protected = os.stat(X_COOLDOWN_KEY_FILE, follow_symlinks=False)
+            if protected.st_mode & 0o077:
+                raise OSError("cooldown key permissions are too broad")
+            if hasattr(os, "getuid") and protected.st_uid != os.getuid():
+                raise OSError("cooldown key has the wrong owner")
+        key_id = hashlib.sha256(_X_COOLDOWN_KEY_CONTEXT + raw).hexdigest()
+        stored_key_id = S.get("x_cooldown_key_id")
+        existing_scoped = getattr(S, "x_login_cooldowns", lambda: {})()
+        if stored_key_id is None:
+            if existing_scoped:
+                raise OSError("cooldown key identity missing for scoped records")
+            S.set("x_cooldown_key_id", key_id)
+        elif (
+            not isinstance(stored_key_id, str)
+            or len(stored_key_id) != 64
+            or not hmac.compare_digest(stored_key_id, key_id)
+        ):
+            raise OSError("cooldown key identity mismatch")
+        _x_cooldown_hmac_key = raw
+        return raw
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        _x_cooldown_key_error = True
+        log.error("تعذّر تحميل مفتاح فصل عدادات X (%s)", type(exc).__name__)
+        return None
+
+
+def _x_cooldown_scope(username):
+    canonical = _canonical_x_username(username)
+    key = _load_x_cooldown_hmac_key()
+    if canonical is None or key is None:
+        return None
+    return hmac.new(
+        key, _X_COOLDOWN_KEY_CONTEXT + canonical.encode("ascii"), hashlib.sha256,
+    ).hexdigest()
 
 
 # ============ حالة محادثات الإعداد (بمهلة) ============
@@ -494,6 +609,7 @@ def _set_x_password_pending(uid, st, email):
     next_state = {
         "action": "x_pass_pending",
         "x_username": st.get("x_username"),
+        "x_cooldown_scope": st.get("x_cooldown_scope"),
         "x_email": email,
         "x_chat_id": st.get("x_chat_id"),
         "x_setup_id": st.get("x_setup_id"),
@@ -1713,8 +1829,9 @@ async def _create_x_cooldown_message(generation):
         ):
             return True
         if not S.is_admin(record["chat_id"]):
-            _mark_x_cooldown_notified(generation)
-            return True
+            # سحب صلاحية مستلم الرسالة لا يعني أن حظر X انتهى. نبقي المؤقت
+            # نافذاً ونحاول لاحقاً؛ وسمه notified هنا كان يفتح الدخول مبكراً.
+            return False
         try:
             message = await _tg_call(
                 bot.send_message, record["chat_id"], _x_cooldown_text(record),
@@ -1924,6 +2041,303 @@ async def _shutdown_x_cooldown(timeout=X_COOLDOWN_SHUTDOWN_TIMEOUT):
         log.warning("لم تتوقف مهمة عداد X ضمن مهلة الإغلاق؛ سأكمل restart")
 
 
+# ============ عدادات دخول X المنفصلة لكل حساب ============
+def _x_account_cooldown_record(scope):
+    if not scope:
+        return None
+    record = _x_account_cooldown_memory.get(scope)
+    if record is None:
+        record = S.x_login_cooldown_for(scope)
+    if not record:
+        return None
+    record = dict(record)
+    runtime = _x_account_cooldown_runtime.get(scope)
+    duration = record["duration_seconds"]
+    runtime_current = runtime and runtime.get("generation") == record["generation"]
+    clock_behind = (
+        not runtime_current and record["until"] - time.time() > duration + 5
+    )
+    if not runtime_current:
+        wall_remaining = duration if clock_behind else max(
+            0, min(duration, record["until"] - time.time())
+        )
+        _x_account_cooldown_runtime[scope] = {
+            "generation": record["generation"],
+            "deadline": time.monotonic() + wall_remaining,
+        }
+    return record
+
+
+def _x_account_cooldown_remaining(scope, record=None, now=None):
+    record = record or _x_account_cooldown_record(scope)
+    if not record or record.get("notified"):
+        return 0
+    runtime = _x_account_cooldown_runtime.get(scope)
+    if (
+        now is None
+        and runtime
+        and runtime.get("generation") == record["generation"]
+    ):
+        return max(0, min(
+            record["duration_seconds"],
+            int(runtime["deadline"] - time.monotonic() + 0.999999),
+        ))
+    now = time.time() if now is None else now
+    return max(0, min(
+        record["duration_seconds"], int(record["until"] - now + 0.999999),
+    ))
+
+
+def _x_account_cooldown_text(scope, record=None):
+    record = record or _x_account_cooldown_record(scope)
+    remaining = _x_account_cooldown_remaining(scope, record)
+    end_at = time.strftime("%H:%M", time.localtime(record["until"]))
+    return (
+        "⏳ أوقف X الدخول إلى هذا الحساب مؤقتاً. هذا العداد خاص بهذا الحساب فقط؛ "
+        "يمكنك إضافة حساب X آخر أثناء الانتظار.\n\n"
+        f"⏱ الوقت الاحترازي المتبقي: `{_format_x_cooldown(remaining)}`\n"
+        f"🕒 ينتهي تقريباً عند الساعة `{end_at}` حسب وقت Raspberry Pi.\n"
+        "انتظر انتهاء العداد لهذا الحساب. لن يحاول البوت الدخول تلقائياً، "
+        "وسيحدّث هذه الرسالة كل دقيقة."
+    )
+
+
+def _x_account_cooldown_task_done(scope, task):
+    if _x_account_cooldown_tasks.get(scope) is task:
+        _x_account_cooldown_tasks.pop(scope, None)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("توقفت مهمة عداد حساب X (%s)", type(exc).__name__)
+
+
+def _ensure_x_account_cooldown_scheduler(scope, record=None):
+    record = record or _x_account_cooldown_record(scope)
+    if not record or record.get("notified"):
+        return None
+    generation = record["generation"]
+    current = _x_account_cooldown_tasks.get(scope)
+    if (
+        current is not None
+        and not current.done()
+        and getattr(current, "_x_cooldown_generation", None) == generation
+    ):
+        return current
+    if current is not None and not current.done():
+        current.cancel()
+    task = asyncio.create_task(_run_x_account_cooldown(scope, generation))
+    task._x_cooldown_generation = generation
+    task.add_done_callback(lambda done, key=scope: _x_account_cooldown_task_done(key, done))
+    _x_account_cooldown_tasks[scope] = task
+    return task
+
+
+async def _create_x_account_cooldown_message(scope, generation):
+    async with _get_x_cooldown_lock():
+        record = _x_account_cooldown_record(scope)
+        if (
+            not record or record["generation"] != generation
+            or record.get("notified") or record.get("message_id")
+            or _x_account_cooldown_remaining(scope, record) <= 0
+        ):
+            return True
+        if not S.is_admin(record["chat_id"]):
+            # فصل صلاحية Telegram عن صلاحية مؤقت X: لا نرسل للأدمن المسحوب،
+            # لكن لا نحوّل المؤقت النشط إلى منتهٍ قبل موعده.
+            return False
+        try:
+            message = await _tg_call(
+                bot.send_message, record["chat_id"],
+                _x_account_cooldown_text(scope, record),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر إنشاء رسالة عداد حساب X (%s)", type(exc).__name__)
+            return False
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            return False
+        current = _x_account_cooldown_record(scope)
+        if not current or current["generation"] != generation:
+            return True
+        try:
+            return S.set_x_login_cooldown_message_for(scope, generation, message_id)
+        except OSError as exc:
+            current["message_id"] = message_id
+            _x_account_cooldown_memory[scope] = current
+            log.warning("تعذّر حفظ رسالة عداد حساب X (%s)", type(exc).__name__)
+            return True
+
+
+def _mark_x_account_cooldown_notified(scope, generation):
+    key = (scope, generation)
+    memory = _x_account_cooldown_memory.get(scope)
+    if memory and memory.get("generation") == generation:
+        memory["notified"] = True
+        _x_account_cooldown_notified_memory.add(key)
+        return True
+    try:
+        return S.mark_x_login_cooldown_notified_for(scope, generation)
+    except OSError as exc:
+        _x_account_cooldown_notified_memory.add(key)
+        log.error("تعذّر تثبيت انتهاء عداد حساب X (%s)", type(exc).__name__)
+        return False
+
+
+async def _notify_x_account_cooldown_ready(scope, generation):
+    key = (scope, generation)
+    if key in _x_account_cooldown_notifying:
+        return False
+    _x_account_cooldown_notifying.add(key)
+    try:
+        async with _get_x_cooldown_lock():
+            record = _x_account_cooldown_record(scope)
+            if (
+                not record or record["generation"] != generation
+                or record.get("notified") or key in _x_account_cooldown_notified_memory
+                or _x_account_cooldown_remaining(scope, record) > 0
+            ):
+                return True
+            if not S.is_admin(record["chat_id"]):
+                _mark_x_account_cooldown_notified(scope, generation)
+                return True
+            text = (
+                "✅ انتهى انتظار البوت لهذا الحساب. لا يضمن ذلك أن X رفع الحظر، "
+                "لكن يمكنك بدء محاولة جديدة. لن تُعاد أي كلمة مرور تلقائياً."
+            )
+            await _edit_x_cooldown_message(
+                record, text, buttons=_x_cooldown_ready_buttons(),
+            )
+            current = _x_account_cooldown_record(scope)
+            if not current or current["generation"] != generation:
+                return True
+            try:
+                await _tg_call(
+                    bot.send_message, record["chat_id"], text,
+                    buttons=_x_cooldown_ready_buttons(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("تعذّر إرسال انتهاء عداد حساب X (%s)", type(exc).__name__)
+                return False
+            _mark_x_account_cooldown_notified(scope, generation)
+            return True
+    finally:
+        _x_account_cooldown_notifying.discard(key)
+
+
+async def _run_x_account_cooldown(scope, generation):
+    while True:
+        record = _x_account_cooldown_record(scope)
+        key = (scope, generation)
+        if (
+            not record or record["generation"] != generation
+            or record.get("notified") or key in _x_account_cooldown_notified_memory
+        ):
+            return
+        remaining = _x_account_cooldown_remaining(scope, record)
+        if remaining <= 0:
+            if await _notify_x_account_cooldown_ready(scope, generation):
+                return
+            await asyncio.sleep(X_COOLDOWN_NOTIFY_RETRY_SECONDS)
+            continue
+        if not record.get("message_id"):
+            if await _create_x_account_cooldown_message(scope, generation):
+                continue
+            await asyncio.sleep(X_COOLDOWN_NOTIFY_RETRY_SECONDS)
+            continue
+        await _edit_x_cooldown_message(
+            record, _x_account_cooldown_text(scope, record),
+        )
+        await asyncio.sleep(min(X_COOLDOWN_UPDATE_SECONDS, remaining))
+
+
+async def _activate_x_account_cooldown(event, scope):
+    async with _get_x_cooldown_lock():
+        generation = secrets.token_hex(16)
+        record = {
+            "generation": generation,
+            "started_at": time.time(),
+            "duration_seconds": X_LOGIN_COOLDOWN_SECONDS,
+            "chat_id": int(event.chat_id),
+            "message_id": None,
+            "notified": False,
+        }
+        record["until"] = record["started_at"] + record["duration_seconds"]
+        _x_account_cooldown_runtime[scope] = {
+            "generation": generation,
+            "deadline": time.monotonic() + record["duration_seconds"],
+        }
+        try:
+            record = S.start_x_login_cooldown_for(
+                scope, record["until"], record["chat_id"],
+                generation=generation, duration_seconds=record["duration_seconds"],
+            )
+            _x_account_cooldown_memory.pop(scope, None)
+        except (OSError, ValueError) as exc:
+            _x_account_cooldown_memory[scope] = dict(record)
+            log.error("تعذّر حفظ عداد حساب X (%s)", type(exc).__name__)
+            if isinstance(exc, ValueError):
+                # امتلاء خريطة العدادات مع 32 حساباً نشطاً حالة شاذة. نحفظ
+                # حارساً عالمياً صريحاً كي لا يضيع المنع بعد restart؛ وهو مميز
+                # عن legacy القديم الذي لا يجوز أن يمنع الحساب الثاني.
+                try:
+                    S.set_many({
+                        "x_login_cooldown": dict(record),
+                        "x_login_cooldown_emergency": True,
+                    })
+                except OSError as save_exc:
+                    log.error(
+                        "تعذّر حفظ حارس امتلاء عدادات X (%s)",
+                        type(save_exc).__name__,
+                    )
+        try:
+            message = await event.respond(_x_account_cooldown_text(scope, record))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("تعذّر إرسال بدء عداد حساب X (%s)", type(exc).__name__)
+            _ensure_x_account_cooldown_scheduler(scope, record)
+            return record
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, int) and not isinstance(message_id, bool):
+            memory = _x_account_cooldown_memory.get(scope)
+            if memory and memory.get("generation") == generation:
+                memory["message_id"] = message_id
+            else:
+                try:
+                    S.set_x_login_cooldown_message_for(scope, generation, message_id)
+                except OSError as exc:
+                    record = dict(record)
+                    record["message_id"] = message_id
+                    _x_account_cooldown_memory[scope] = record
+                    log.warning("تعذّر حفظ معرّف عداد حساب X (%s)", type(exc).__name__)
+        _ensure_x_account_cooldown_scheduler(scope, record)
+        return record
+
+
+async def _consume_expired_x_account_cooldown(scope, record):
+    if not record or record.get("notified"):
+        return
+    async with _get_x_cooldown_lock():
+        current = _x_account_cooldown_record(scope)
+        if (
+            current and current["generation"] == record["generation"]
+            and _x_account_cooldown_remaining(scope, current) <= 0
+        ):
+            _mark_x_account_cooldown_notified(scope, current["generation"])
+
+
+async def _shutdown_x_account_cooldowns(timeout=X_COOLDOWN_SHUTDOWN_TIMEOUT):
+    tasks = [task for task in _x_account_cooldown_tasks.values() if not task.done()]
+    _x_account_cooldown_tasks.clear()
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    _done, pending = await asyncio.wait(set(tasks), timeout=timeout)
+    if pending:
+        log.warning("لم تتوقف كل مهام عدادات حسابات X ضمن مهلة الإغلاق")
+
+
 async def _notify_owner(text):
     chat = S.get("review_chat_id") or S.get("owner_id")
     if not chat:
@@ -1976,29 +2390,12 @@ async def on_xlogin(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
-        cooldown = _x_cooldown_record()
-        remaining = _x_cooldown_remaining(cooldown)
-        if remaining > 0:
-            _ensure_x_cooldown_scheduler(cooldown)
-            await event.answer(
-                "⏳ ما زال عداد X يعمل. المتبقي: "
-                f"{_format_x_cooldown(remaining)}. سأرسل زر المحاولة عند انتهائه.",
-                alert=True,
-            )
-            return
         if not _is_private_chat(event):
             await event.answer(
                 "افتح محادثة البوت الخاصة واضغط «⚙️ لوحة التحكم» لإضافة حساب X بأمان.",
                 alert=True,
             )
             return
-        # لا يستطيع أدمن آخر أو زر داخل مجموعة إسكات إشعار صاحب العداد.
-        if (
-            cooldown
-            and not cooldown.get("notified")
-            and cooldown.get("chat_id") == event.chat_id
-        ):
-            await _consume_expired_x_cooldown(cooldown)
         existing = _x_login_tasks.get(event.sender_id)
         if existing is not None and not existing.done():
             await event.answer(
@@ -2777,9 +3174,37 @@ async def on_text(event):
         _clear_state(uid)
         await event.respond(f"🗑️ حُذف {removed} قناة." if removed else "لم أجد قناة مطابقة.")
     elif action == "x_user":
+        username = _canonical_x_username(text)
+        if username is None:
+            await event.respond(
+                "❌ اسم مستخدم X غير صالح. أرسل 1–15 حرفاً إنجليزياً أو رقماً "
+                "أو شرطة سفلية، بدون رابط."
+            )
+            return
+        scope = _x_cooldown_scope(username)
+        if scope is None:
+            _clear_state(uid)
+            await event.respond(
+                "❌ تعذّر فتح مخزن عدادات حسابات X بأمان. لم تبدأ محاولة دخول؛ "
+                "افحص ملف حالة البوت ثم أعد المحاولة."
+            )
+            return
+        cooldown = _x_account_cooldown_record(scope)
+        remaining = _x_account_cooldown_remaining(scope, cooldown)
+        if remaining > 0:
+            _clear_state(uid)
+            _ensure_x_account_cooldown_scheduler(scope, cooldown)
+            await event.respond(
+                "⏳ هذا الحساب وحده ما زال ضمن وقت الانتظار. المتبقي: "
+                f"`{_format_x_cooldown(remaining)}`. يمكنك إضافة حساب X آخر الآن."
+            )
+            return
+        if cooldown and not cooldown.get("notified"):
+            await _consume_expired_x_account_cooldown(scope, cooldown)
         _set_state(uid, {
             "action": "x_email",
-            "x_username": text.lstrip("@"),
+            "x_username": username,
+            "x_cooldown_scope": scope,
             "x_chat_id": st.get("x_chat_id", event.chat_id),
             "x_setup_id": st.get("x_setup_id") or _new_x_setup_id(),
         })
@@ -2901,15 +3326,40 @@ async def _save_x_login(event, st, password):
     email = st.get("x_email")
     setup_id = st.get("x_setup_id") or _new_x_setup_id()
     uid = event.sender_id
-    cooldown = _x_cooldown_record()
-    remaining = _x_cooldown_remaining(cooldown)
+    scope = _x_cooldown_scope(username)
+    if scope is None or (
+        st.get("x_cooldown_scope") is not None
+        and st.get("x_cooldown_scope") != scope
+    ):
+        deleted = await _delete_secret_message(event)
+        _cancel_x_login(uid, cancel_task=False, remember_secret=False)
+        await event.respond(
+            "❌ لم أستخدم كلمة المرور لأن هوية محاولة X غير صالحة. ابدأ الإضافة من جديد."
+            + ("" if deleted else " احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        )
+        return
+    cooldown = _x_account_cooldown_record(scope)
+    remaining = _x_account_cooldown_remaining(scope, cooldown)
+    emergency = _x_cooldown_record() if S.get("x_login_cooldown_emergency") else None
+    emergency_remaining = _x_cooldown_remaining(emergency)
+    if emergency_remaining > 0:
+        deleted = await _delete_secret_message(event)
+        _cancel_x_login(uid, cancel_task=False, remember_secret=False)
+        _ensure_x_cooldown_scheduler(emergency)
+        await event.respond(
+            "⏳ لم أستخدم كلمة المرور لأن مخزن عدادات X وصل حد الأمان. "
+            f"المتبقي: `{_format_x_cooldown(emergency_remaining)}`."
+            + ("" if deleted else " احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        )
+        return
     if remaining > 0:
         deleted = await _delete_secret_message(event)
         _cancel_x_login(uid, cancel_task=False, remember_secret=False)
-        _ensure_x_cooldown_scheduler(cooldown)
+        _ensure_x_account_cooldown_scheduler(scope, cooldown)
         await event.respond(
-            "⏳ لم أستخدم كلمة المرور لأن عداد انتظار X ما زال يعمل. "
+            "⏳ لم أستخدم كلمة المرور لأن هذا الحساب وحده ما زال ضمن الانتظار. "
             f"المتبقي: `{_format_x_cooldown(remaining)}`."
+            " يمكنك إضافة حساب X آخر الآن."
             + ("" if deleted else " احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
         )
         return
@@ -2975,9 +3425,18 @@ async def _save_x_login(event, st, password):
 
     async def challenge_handler(kind, prompt=""):
         _require_x_admin(uid)
+        safe_kind = {
+            "alternate_identifier": "alternate_identifier",
+            "two_factor": "two_factor",
+            "verification": "verification_code",
+        }.get(kind)
+        if safe_kind:
+            _log_xlogin_stage(f"challenge_requested_{safe_kind}")
         response = await _wait_for_x_challenge(
             event, kind, prompt, setup_id=setup_id,
         )
+        if safe_kind:
+            _log_xlogin_stage(f"challenge_received_{safe_kind}")
         _require_x_admin(uid)
         return response
 
@@ -2997,19 +3456,29 @@ async def _save_x_login(event, st, password):
                 "احذفها يدوياً ثم ابدأ إضافة الحساب مجدداً."
             )
             return
-        # قد يبدأ cooldown عالمي أثناء انتظار حذف رسالة السر. نفحصه مرة ثانية
+        # قد يبدأ عداد لهذا الحساب أثناء انتظار حذف رسالة السر. نفحصه مرة ثانية
         # قبل أي اتصال بالمتصفح، ولا نحتفظ بالاعتماد في مهمة انتظار طويلة.
-        cooldown = _x_cooldown_record()
-        remaining = _x_cooldown_remaining(cooldown)
-        if remaining > 0:
-            _ensure_x_cooldown_scheduler(cooldown)
+        cooldown = _x_account_cooldown_record(scope)
+        remaining = _x_account_cooldown_remaining(scope, cooldown)
+        emergency = _x_cooldown_record() if S.get("x_login_cooldown_emergency") else None
+        emergency_remaining = _x_cooldown_remaining(emergency)
+        if emergency_remaining > 0:
+            _ensure_x_cooldown_scheduler(emergency)
             await event.respond(
-                "⏳ أُوقفت المحاولة قبل الاتصال بـ X لأن عداد الانتظار بدأ. "
+                "⏳ أُوقفت المحاولة قبل الاتصال بـ X لأن مخزن العدادات وصل حد الأمان. "
+                f"المتبقي: `{_format_x_cooldown(emergency_remaining)}`."
+            )
+            return
+        if remaining > 0:
+            _ensure_x_account_cooldown_scheduler(scope, cooldown)
+            await event.respond(
+                "⏳ أُوقفت المحاولة قبل الاتصال بـ X لأن عداد هذا الحساب بدأ. "
                 f"المتبقي: `{_format_x_cooldown(remaining)}`."
             )
             return
         _require_x_admin(uid)
         login_generation = xreader.invalidate()
+        _log_xlogin_stage("login_started")
         await event.respond(
             "⏳ أحاول تسجيل الدخول إلى X عبر متصفح معزول على Raspberry Pi… "
             "إذا طلب X تحققاً إضافياً سأطلبه هنا."
@@ -3047,6 +3516,18 @@ async def _save_x_login(event, st, password):
                 )
             )
             return
+        _log_xlogin_stage("session_verified")
+        old_cooldown = _x_account_cooldown_record(scope)
+        cooldown_task = _x_account_cooldown_tasks.pop(scope, None)
+        if cooldown_task is not None and not cooldown_task.done():
+            cooldown_task.cancel()
+        _x_account_cooldown_memory.pop(scope, None)
+        _x_account_cooldown_runtime.pop(scope, None)
+        if old_cooldown:
+            try:
+                S.remove_x_login_cooldown_for(scope, old_cooldown["generation"])
+            except OSError as exc:
+                log.warning("تعذّر تنظيف عداد حساب X الناجح (%s)", type(exc).__name__)
         await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
     except asyncio.TimeoutError:
         await event.respond("⌛ انتهت مهلة رمز X. ابدأ إضافة الحساب مجدداً.")
@@ -3068,7 +3549,8 @@ async def _save_x_login(event, st, password):
     except XBrowserRateLimited:
         # لا نُبقي كلمة المرور في ذاكرة مهمة العداد أو أثناء RPC Telegram.
         credentials.clear()
-        await _activate_x_login_cooldown(event)
+        _log_xlogin_stage("rate_limited")
+        await _activate_x_account_cooldown(event, scope)
     except XBrowserUnavailable:
         await event.respond(
             "❌ متصفح تسجيل X غير متوفر أو تعذّر الوصول إلى صفحة X الآن. "
@@ -3107,6 +3589,7 @@ async def _save_x_login(event, st, password):
             "ثم أعد المحاولة."
         )
     finally:
+        _log_xlogin_stage("attempt_finished")
         _x_login_deleting.discard(uid)
         _x_login_cancelled.discard(uid)
         credentials.clear()
@@ -3436,6 +3919,8 @@ async def main():
     # يعيد تشغيل العداد المحفوظ بعد restart، أو يرسل إشعار الانتهاء فوراً إذا
     # انقضى الموعد والبوت كان متوقفاً.
     _ensure_x_cooldown_scheduler()
+    for scope, record in S.x_login_cooldowns().items():
+        _ensure_x_account_cooldown_scheduler(scope, record)
 
     # بعد ترقية نسخة قديمة، تصل لوحة الأزرار للأدمنين تلقائياً مرة واحدة؛
     # لا يحتاج المستخدم إلى كتابة /start أو /panel كي تظهر له.
@@ -3485,6 +3970,7 @@ async def main():
     finally:
         _restarting = True
         await _shutdown_x_cooldown()
+        await _shutdown_x_account_cooldowns()
         if not await _shutdown_x_logins():
             log.critical("تعذّر تأكيد إغلاق متصفح X أثناء إيقاف البوت")
 

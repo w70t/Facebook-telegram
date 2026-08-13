@@ -38,6 +38,15 @@ def test_crash_leftover_x_cookie_temp_is_gitignored():
     assert result.returncode == 0
 
 
+def test_x_cooldown_hmac_key_is_gitignored():
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", "x_cooldown_key.json"],
+        cwd=ROOT,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
 # --- سقف المنشورات المعلّقة (إغراق القرص) ---
 def test_pending_queue_is_capped(tmp_path):
     downloads = tmp_path / "dl"

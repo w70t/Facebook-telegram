@@ -46,6 +46,15 @@ DEFAULTS = {
     # حظر احترازي لمحاولات دخول X. لا يحتوي اسم مستخدم أو كلمة مرور؛ فقط موعد
     # الانتهاء ومحادثة/رسالة Telegram التي تعرض العداد.
     "x_login_cooldown": None,
+    # True only for the fail-closed storage-capacity fallback. A legacy timer
+    # from older releases has no such flag and must not block unrelated accounts.
+    "x_login_cooldown_emergency": False,
+    # Public integrity tag for the separate HMAC key; never the key itself.
+    "x_cooldown_key_id": None,
+    # Account-scoped cooldowns. Keys are opaque 64-hex fingerprints produced
+    # by the caller; raw X account identifiers and credentials never belong here.
+    # Keep x_login_cooldown above for rollback and legacy migration.
+    "x_login_cooldowns": {},
     "filter_words": [],          # كلمات ممنوعة: أي منشور يحتويها يُتجاهل
     # حدود التشغيل — تحمي بطاقة الـ SD من الامتلاء
     "max_media_mb": 200,         # أقصى حجم وسيط يُنزَّل
@@ -58,6 +67,8 @@ _BACKUP_COMMITTED = "committed"
 _PRIMARY_TXID = "__settings_txid"
 _MAX_UNIX_TIMESTAMP = 253402300799  # 9999-12-31T23:59:59Z
 _MAX_X_LOGIN_COOLDOWN_SECONDS = 24 * 60 * 60
+_MAX_X_LOGIN_COOLDOWNS = 32
+_X_LOGIN_SCOPE_HEX_LENGTH = 64
 
 
 def _valid_txid(value):
@@ -535,6 +546,172 @@ class Settings:
             updated["notified"] = True
             self._replace("x_login_cooldown", updated)
             return True
+
+    # --- Account-scoped X login cooldowns ---
+    @staticmethod
+    def _valid_x_login_cooldown_scope(value):
+        """Return a canonical opaque fingerprint, never a raw account identity."""
+        if (
+            not isinstance(value, str)
+            or len(value) != _X_LOGIN_SCOPE_HEX_LENGTH
+            or any(character not in "0123456789abcdefABCDEF" for character in value)
+        ):
+            return None
+        return value.lower()
+
+    @classmethod
+    def _valid_x_login_cooldowns(cls, value):
+        """Sanitize each scoped record independently and enforce a hard size cap."""
+        if not isinstance(value, dict):
+            return {}
+        cooldowns = {}
+        for raw_scope, raw_record in value.items():
+            scope = cls._valid_x_login_cooldown_scope(raw_scope)
+            record = cls._valid_x_login_cooldown(raw_record)
+            if scope is None or record is None or scope in cooldowns:
+                continue
+            cooldowns[scope] = record
+            if len(cooldowns) == _MAX_X_LOGIN_COOLDOWNS:
+                break
+        return cooldowns
+
+    @classmethod
+    def _require_x_login_cooldown_scope(cls, value):
+        scope = cls._valid_x_login_cooldown_scope(value)
+        if scope is None:
+            raise ValueError("invalid X login cooldown scope")
+        return scope
+
+    def x_login_cooldowns(self):
+        """List valid cooldowns by opaque account fingerprint."""
+        with self._lock:
+            return copy.deepcopy(
+                self._valid_x_login_cooldowns(
+                    self.data.get("x_login_cooldowns")
+                )
+            )
+
+    def x_login_cooldown_for(self, scope):
+        """Get one account's cooldown without exposing another account's state."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        with self._lock:
+            return copy.deepcopy(self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            ).get(scope))
+
+    def start_x_login_cooldown_for(
+        self, scope, until, chat_id, *, generation=None, message_id=None,
+        duration_seconds=3600,
+    ):
+        """Atomically start or replace only the cooldown for ``scope``."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        record = self._valid_x_login_cooldown({
+            "generation": generation or secrets.token_hex(16),
+            "started_at": float(until) - float(duration_seconds),
+            "until": until,
+            "duration_seconds": duration_seconds,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "notified": False,
+        })
+        if record is None:
+            raise ValueError("invalid X login cooldown")
+        with self._lock:
+            cooldowns = self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            )
+            if scope not in cooldowns and len(cooldowns) >= _MAX_X_LOGIN_COOLDOWNS:
+                removable = sorted(
+                    (
+                        (key, value) for key, value in cooldowns.items()
+                        if value["notified"]
+                    ),
+                    key=lambda item: item[1]["until"],
+                )
+                while removable and len(cooldowns) >= _MAX_X_LOGIN_COOLDOWNS:
+                    old_scope, _old_record = removable.pop(0)
+                    cooldowns.pop(old_scope, None)
+                if len(cooldowns) >= _MAX_X_LOGIN_COOLDOWNS:
+                    raise ValueError("too many active X login cooldowns")
+            cooldowns[scope] = record
+            self._replace("x_login_cooldowns", cooldowns)
+        return copy.deepcopy(record)
+
+    def set_x_login_cooldown_message_for(self, scope, generation, message_id):
+        """CAS-bind a Telegram countdown message to one account and generation."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        with self._lock:
+            cooldowns = self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            )
+            current = cooldowns.get(scope)
+            if current is None or current["generation"] != generation:
+                return False
+            updated = dict(current)
+            updated["message_id"] = message_id
+            updated = self._valid_x_login_cooldown(updated)
+            if updated is None:
+                raise ValueError("invalid Telegram message id")
+            cooldowns[scope] = updated
+            self._replace("x_login_cooldowns", cooldowns)
+            return True
+
+    def mark_x_login_cooldown_notified_for(self, scope, generation):
+        """CAS-mark one account generation notified, idempotently."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        with self._lock:
+            cooldowns = self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            )
+            current = cooldowns.get(scope)
+            if current is None or current["generation"] != generation:
+                return False
+            if current["notified"]:
+                return True
+            updated = dict(current)
+            updated["notified"] = True
+            cooldowns[scope] = updated
+            self._replace("x_login_cooldowns", cooldowns)
+            return True
+
+    def remove_x_login_cooldown_for(self, scope, generation):
+        """CAS-remove one generation without letting stale workers remove a newer one."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        with self._lock:
+            cooldowns = self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            )
+            current = cooldowns.get(scope)
+            if current is None or current["generation"] != generation:
+                return False
+            del cooldowns[scope]
+            self._replace("x_login_cooldowns", cooldowns)
+            return True
+
+    def bind_legacy_x_login_cooldown_to(self, scope):
+        """Atomically move the identity-less legacy timer to a confirmed scope."""
+        scope = self._require_x_login_cooldown_scope(scope)
+        with self._lock:
+            legacy = self._valid_x_login_cooldown(
+                self.data.get("x_login_cooldown")
+            )
+            if legacy is None:
+                return None
+            cooldowns = self._valid_x_login_cooldowns(
+                self.data.get("x_login_cooldowns")
+            )
+            existing = cooldowns.get(scope)
+            if existing is not None and existing["generation"] != legacy["generation"]:
+                raise ValueError("scope already has a different X login cooldown")
+            if existing is None and len(cooldowns) >= _MAX_X_LOGIN_COOLDOWNS:
+                raise ValueError("too many X login cooldowns")
+            cooldowns[scope] = legacy
+            candidate = copy.deepcopy(self.data)
+            candidate["x_login_cooldowns"] = cooldowns
+            candidate["x_login_cooldown"] = None
+            candidate["x_login_cooldown_emergency"] = False
+            self._commit(candidate)
+            return copy.deepcopy(legacy)
 
     # --- الحسابات المتابَعة ---
     def x_accounts(self):

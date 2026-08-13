@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import stat
@@ -567,3 +568,237 @@ def test_inconsistent_x_login_cooldown_duration_is_ignored(settings):
         "notified": False,
     })
     assert settings.x_login_cooldown() is None
+
+
+def test_scoped_x_login_cooldowns_are_independent_and_durable(settings):
+    scope_a = "a" * 64
+    scope_b = "b" * 64
+    until = time.time() + 3600
+
+    settings.start_x_login_cooldown_for(
+        scope_a, until, 42, generation="account-a",
+    )
+    settings.start_x_login_cooldown_for(
+        scope_b, until + 100, 84, generation="account-b",
+    )
+    assert settings.set_x_login_cooldown_message_for(
+        scope_a, "account-a", 111,
+    ) is True
+    assert settings.mark_x_login_cooldown_notified_for(
+        scope_b, "account-b",
+    ) is True
+
+    assert settings.x_login_cooldown_for(scope_a)["message_id"] == 111
+    assert settings.x_login_cooldown_for(scope_a)["notified"] is False
+    assert settings.x_login_cooldown_for(scope_b)["message_id"] is None
+    assert settings.x_login_cooldown_for(scope_b)["notified"] is True
+    assert set(settings.x_login_cooldowns()) == {scope_a, scope_b}
+
+    reloaded = Settings(path=settings.path)
+    assert reloaded.x_login_cooldown_for(scope_a)["generation"] == "account-a"
+    assert reloaded.x_login_cooldown_for(scope_b)["generation"] == "account-b"
+
+
+def test_scoped_x_login_cooldown_cas_cannot_cross_accounts_or_generations(settings):
+    scope_a = "a" * 64
+    scope_b = "b" * 64
+    until = time.time() + 3600
+    settings.start_x_login_cooldown_for(
+        scope_a, until, 42, generation="old-a",
+    )
+    settings.start_x_login_cooldown_for(
+        scope_b, until, 84, generation="only-b",
+    )
+    settings.start_x_login_cooldown_for(
+        scope_a, until + 60, 42, generation="new-a",
+    )
+
+    assert settings.set_x_login_cooldown_message_for(
+        scope_a, "old-a", 111,
+    ) is False
+    assert settings.mark_x_login_cooldown_notified_for(
+        scope_a, "old-a",
+    ) is False
+    assert settings.remove_x_login_cooldown_for(scope_a, "old-a") is False
+    assert settings.remove_x_login_cooldown_for(scope_a, "only-b") is False
+    assert settings.x_login_cooldown_for(scope_a)["generation"] == "new-a"
+    assert settings.x_login_cooldown_for(scope_b)["generation"] == "only-b"
+
+    assert settings.remove_x_login_cooldown_for(scope_a, "new-a") is True
+    assert settings.x_login_cooldown_for(scope_a) is None
+    assert settings.x_login_cooldown_for(scope_b)["generation"] == "only-b"
+
+
+def test_malformed_scoped_x_login_cooldown_isolated_and_scrubbed(settings):
+    scope_a = "a" * 64
+    scope_b = "b" * 64
+    valid = {
+        "generation": "valid-a",
+        "started_at": 1_000.0,
+        "until": 4_600.0,
+        "duration_seconds": 3_600,
+        "chat_id": 42,
+        "message_id": None,
+        "notified": False,
+        "username": "must-not-survive",
+        "email": "secret@example.test",
+        "password": "secret-password",
+    }
+    malformed = dict(valid, generation="")
+    settings.set("x_login_cooldowns", {
+        scope_a.upper(): valid,
+        scope_b: malformed,
+        "raw-account-name": valid,
+    })
+
+    assert set(settings.x_login_cooldowns()) == {scope_a}
+    assert set(settings.x_login_cooldown_for(scope_a)) == {
+        "generation", "started_at", "until", "duration_seconds", "chat_id",
+        "message_id", "notified",
+    }
+    assert settings.x_login_cooldown_for(scope_b) is None
+
+    # A successful scoped mutation rewrites the map from its sanitized view.
+    assert settings.set_x_login_cooldown_message_for(
+        scope_a, "valid-a", 123,
+    ) is True
+    serialized = Path(settings.path).read_text(encoding="utf-8")
+    assert "must-not-survive" not in serialized
+    assert "secret@example.test" not in serialized
+    assert "secret-password" not in serialized
+    assert "raw-account-name" not in serialized
+
+
+def test_scoped_x_login_cooldown_failed_transaction_keeps_all_accounts(
+    settings, monkeypatch,
+):
+    scope_a = "a" * 64
+    scope_b = "b" * 64
+    until = time.time() + 3600
+    settings.start_x_login_cooldown_for(
+        scope_a, until, 42, generation="safe-a",
+    )
+    before = settings.x_login_cooldowns()
+    primary_before = read_document(settings.path)
+    backup_before = read_document(settings.path + ".bak")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(settings_module, "atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="disk unavailable"):
+        settings.start_x_login_cooldown_for(
+            scope_b, until, 84, generation="not-committed-b",
+        )
+
+    assert settings.x_login_cooldowns() == before
+    assert read_document(settings.path) == primary_before
+    assert read_document(settings.path + ".bak") == backup_before
+
+
+def test_scoped_x_login_cooldowns_are_bounded_and_require_opaque_scope(settings):
+    until = time.time() + 3600
+    with pytest.raises(ValueError, match="scope"):
+        settings.start_x_login_cooldown_for(
+            "raw-account-name", until, 42, generation="bad",
+        )
+
+    for number in range(32):
+        settings.start_x_login_cooldown_for(
+            f"{number:064x}", until, 42, generation=f"generation-{number}",
+        )
+    before = settings.x_login_cooldowns()
+    with pytest.raises(ValueError, match="too many"):
+        settings.start_x_login_cooldown_for(
+            f"{32:064x}", until, 42, generation="generation-32",
+        )
+    assert settings.x_login_cooldowns() == before
+
+
+def test_scoped_x_login_cooldown_prunes_notified_before_rejecting_new(settings):
+    now = time.time()
+    for number in range(32):
+        scope = f"{number:064x}"
+        settings.start_x_login_cooldown_for(
+            scope, now + 3600, 42, generation=f"generation-{number}",
+        )
+    removable = f"{7:064x}"
+    settings.mark_x_login_cooldown_notified_for(removable, "generation-7")
+    new_scope = f"{32:064x}"
+
+    settings.start_x_login_cooldown_for(
+        new_scope, now + 3600, 42, generation="generation-32",
+    )
+
+    cooldowns = settings.x_login_cooldowns()
+    assert len(cooldowns) == 32
+    assert removable not in cooldowns
+    assert cooldowns[new_scope]["generation"] == "generation-32"
+
+
+def test_scoped_x_login_cooldown_never_prunes_unnotified_by_wall_clock(settings):
+    # `until` وحده ليس دليلاً كافياً: بعد إقلاع Pi بساعة قديمة قد يحمي main
+    # السجل بموعد monotonic حتى لو قفزت ساعة النظام للأمام لاحقاً.
+    for number in range(32):
+        settings.start_x_login_cooldown_for(
+            f"{number:064x}", 4_600, 42, generation=f"guarded-{number}",
+        )
+
+    with pytest.raises(ValueError, match="too many"):
+        settings.start_x_login_cooldown_for(
+            f"{32:064x}", 9_000, 42, generation="must-not-prune",
+        )
+
+    assert len(settings.x_login_cooldowns()) == 32
+    assert settings.x_login_cooldown_for(f"{0:064x}")["generation"] == "guarded-0"
+
+
+def test_scoped_x_login_cooldown_storage_contains_no_identity_or_credentials(settings):
+    scope = "c" * 64
+    settings.start_x_login_cooldown_for(
+        scope, time.time() + 3600, 42, generation="opaque-only",
+    )
+    document = read_document(settings.path)
+    stored = document["x_login_cooldowns"]
+    assert set(stored) == {scope}
+    assert set(stored[scope]) == {
+        "generation", "started_at", "until", "duration_seconds", "chat_id",
+        "message_id", "notified",
+    }
+    for forbidden in ("username", "email", "password", "identifier"):
+        assert forbidden not in stored[scope]
+
+
+def test_legacy_x_cooldown_binding_is_atomic_and_preserves_exact_timer(settings):
+    scope = "d" * 64
+    legacy = settings.start_x_login_cooldown(
+        4_600, 42, generation="legacy", message_id=321,
+    )
+    settings.set("x_login_cooldown_emergency", True)
+
+    moved = settings.bind_legacy_x_login_cooldown_to(scope)
+
+    assert moved == legacy
+    assert settings.x_login_cooldown() is None
+    assert settings.get("x_login_cooldown_emergency") is False
+    assert settings.x_login_cooldown_for(scope) == legacy
+    reloaded = Settings(path=settings.path)
+    assert reloaded.x_login_cooldown() is None
+    assert reloaded.x_login_cooldown_for(scope) == legacy
+
+
+def test_failed_legacy_x_cooldown_binding_changes_nothing(settings, monkeypatch):
+    scope = "e" * 64
+    settings.start_x_login_cooldown(4_600, 42, generation="legacy")
+    before = copy.deepcopy(settings.data)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(settings_module, "atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="disk unavailable"):
+        settings.bind_legacy_x_login_cooldown_to(scope)
+
+    assert settings.data == before
+    assert settings.x_login_cooldown()["generation"] == "legacy"
+    assert settings.x_login_cooldown_for(scope) is None

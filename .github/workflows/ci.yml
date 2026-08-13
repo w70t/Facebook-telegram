@@ -55,7 +55,7 @@ jobs:
       - name: التأكد أن الأسرار مستثناة من git
         run: |
           set -e
-          for f in settings.json pending.json x_cookies_someone.json .x-cookies-deadbeef.tmp .tmp-settings-crash.json user_session.session; do
+          for f in settings.json x_cooldown_key.json pending.json x_cookies_someone.json .x-cookies-deadbeef.tmp .tmp-settings-crash.json user_session.session; do
             touch "$f"
             git check-ignore -q "$f" || { echo "❌ $f غير مستثنى في .gitignore"; exit 1; }
             rm -f "$f"
