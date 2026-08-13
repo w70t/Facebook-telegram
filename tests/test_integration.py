@@ -475,10 +475,10 @@ class FakeXClient:
         return self.tweets
 
 
-def test_stale_cookies_trigger_fresh_login(app, monkeypatch, tmp_path):
+def test_stale_cookies_require_explicit_interactive_login(app, monkeypatch, tmp_path):
     """
-    البق الأصلي: كوكيز منتهية تُحمَّل ويوضع ready=True، فيفشل كل جلب ويُحرق
-    الحساب، وزر ♻️ يعيد تحميل نفس الكوكيز الميتة إلى الأبد.
+    poller لا يجوز أن يحاول كلمة المرور أو input عند انتهاء الكوكيز؛ يحذف جلسة
+    401 ويترك تسجيل الدخول التفاعلي لواجهة Telegram التي تستطيع طلب 2FA.
     """
     monkeypatch.setattr(app.xreader.S.__class__, "x_logins",
                         lambda self: [{"username": "acct", "email": None,
@@ -500,18 +500,17 @@ def test_stale_cookies_trigger_fresh_login(app, monkeypatch, tmp_path):
         json.dump({"auth_token": "expired"}, f)
     try:
         app.xreader.invalidate()
-        assert run(app.xreader.ensure_login()) is True
-        assert clients[-1].logged_in, "لم يُعد تسجيل الدخول بعد فشل الكوكيز"
-        assert clients[-1].saved_to == cookie_file
-        if os.name == "posix":
-            assert stat.S_IMODE(os.stat(cookie_file).st_mode) == 0o600
+        assert run(app.xreader.ensure_login()) is False
+        assert not clients[-1].logged_in, "poller حاول تسجيل دخول تفاعلياً"
+        assert clients[-1].saved_to is None
+        assert not os.path.exists(cookie_file), "لم تُحذف جلسة 401 المنتهية"
     finally:
         app.xreader.invalidate()
         if os.path.exists(cookie_file):
             os.remove(cookie_file)
 
 
-def test_auth_failure_drops_cookies(app, monkeypatch, tmp_path):
+def test_ambiguous_forbidden_keeps_session_for_later_retry(app, monkeypatch, tmp_path):
     import twitter
 
     monkeypatch.setattr(twitter, "BASE_DIR", str(tmp_path))
@@ -520,8 +519,13 @@ def test_auth_failure_drops_cookies(app, monkeypatch, tmp_path):
         pass
     try:
         app.xreader.active = "acct"
-        assert app.xreader.report_failure(Exception("403 Forbidden")) is True
-        assert not os.path.exists(cookie_file), "لم تُحذف الكوكيز الفاشلة"
+        app.xreader.client = object()
+        app.xreader.ready = True
+        session = app.xreader.capture_session()
+        assert app.xreader.report_failure(
+            Exception("403 Forbidden"), session=session
+        ) is False
+        assert os.path.exists(cookie_file), "403 غامض حذف جلسة صالحة محتملة"
     finally:
         app.xreader.active = None
         if os.path.exists(cookie_file):
@@ -531,7 +535,12 @@ def test_auth_failure_drops_cookies(app, monkeypatch, tmp_path):
 def test_network_error_does_not_burn_account(app):
     app.xreader.active = "acct"
     try:
-        assert app.xreader.report_failure(Exception("bandwidth limit exceeded")) is False
+        app.xreader.client = object()
+        app.xreader.ready = True
+        session = app.xreader.capture_session()
+        assert app.xreader.report_failure(
+            Exception("bandwidth limit exceeded"), session=session
+        ) is False
         assert app.xreader.active == "acct"
     finally:
         app.xreader.active = None

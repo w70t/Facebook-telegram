@@ -2,4 +2,5 @@
 # فيسمح بكتابة ملفات خارجه (path traversal). لا تخفّض هذا الحد.
 telethon>=1.42,<2
 requests>=2.31
-twikit>=2.0
+# xauth.py يتكامل مع تدفق onboarding الداخلي؛ لا تحدّثه دون تشغيل test_xauth.py.
+twikit==2.3.3

@@ -137,16 +137,43 @@ _publishing: set[str] = set()
 _published: set[str] = set()
 STATE_TTL = 600                    # محادثة إعداد مهجورة تنتهي بعد 10 دقائق
 HOUSEKEEPING_SECONDS = 3600
+X_CHALLENGE_TIMEOUT = 180          # رمز X مؤقت؛ لا نحتفظ به أكثر من 3 دقائق
+X_SECRET_DELETE_TIMEOUT = 15       # لا نحتفظ بكلمة المرور بسبب RPC معلّق بلا حد
+X_SECRET_TOMBSTONE_TTL = STATE_TTL # يغطي مهلة كل محادثة إعداد/رمز متأخر
+
+# محاولة تسجيل X تبقى داخل الذاكرة فقط. لا نضع كلمة المرور أو رمز الاستخدام
+# الواحد في state، ولا نكتب رمز Authenticator إلى settings.json.
+_x_login_tasks: dict[int, asyncio.Task] = {}
+_x_challenges: dict[tuple[int, int], asyncio.Future] = {}
+_x_login_deleting: set[int] = set()
+_x_login_cancelled: set[int] = set()
+_x_secret_tombstones: dict[tuple[int, int], float] = {}
 
 MAX_CLAIM_ATTEMPTS = 5
 _claim_code = None
 _claim_attempts = 0
+
+BTN_PANEL = "⚙️ لوحة التحكم"
+BTN_ID = "🆔 معرّفي"
+BTN_CANCEL = "🛑 إلغاء"
+BTN_CLAIM = "🔑 تفعيل الملكية"
+REPLY_KEYBOARD_VERSION = 1
+_REPLY_ACTIONS = {
+    BTN_PANEL: "panel",
+    BTN_ID: "id",
+    BTN_CANCEL: "cancel",
+    BTN_CLAIM: "claim",
+}
+_RESERVED_COMMANDS = {"/start", "/panel", "/id", "/cancel", "/claim"}
 
 xreader = XReader(S)
 
 
 # ============ حالة محادثات الإعداد (بمهلة) ============
 def _set_state(uid, data):
+    # لا نمسح tombstone لمحاولة سرية ملغاة هنا: قد تكون كلمة المرور/الرمز القديم
+    # ما زالت في الطريق. أول رسالة نصية لاحقة تُحذف fail-closed، ثم يستطيع
+    # المستخدم إعادة إدخال قيمة الخطوة الجديدة بأمان.
     state[uid] = {**data, "ts": time.time()}
 
 
@@ -155,6 +182,7 @@ def _get_state(uid):
     if not st:
         return None
     if time.time() - st.get("ts", 0) > STATE_TTL:
+        _remember_x_secret_tombstone(uid, st)
         state.pop(uid, None)
         return None
     return st
@@ -167,7 +195,237 @@ def _clear_state(uid):
 def _purge_states():
     cutoff = time.time() - STATE_TTL
     for uid in [u for u, st in state.items() if st.get("ts", 0) < cutoff]:
+        _remember_x_secret_tombstone(uid, state.get(uid))
         state.pop(uid, None)
+
+
+async def _delete_secret_message(event):
+    """يحذف كلمة المرور/الرمز ويعيد ما إذا ضمن Telegram نجاح الحذف."""
+    try:
+        await asyncio.wait_for(event.delete(), timeout=X_SECRET_DELETE_TIMEOUT)
+        return True
+    except asyncio.TimeoutError:
+        log.warning("انتهت مهلة حذف رسالة سرية من Telegram")
+        return False
+    except Exception:  # noqa: BLE001
+        log.warning("تعذّر حذف رسالة سرية من Telegram")
+        return False
+
+
+def _remember_x_secret_tombstone(uid, st):
+    if not st or st.get("action") not in {
+        "x_email", "x_pass", "x_auth_code", "claim_code",
+    }:
+        return
+    chat_id = st.get("x_chat_id", st.get("claim_chat_id"))
+    if chat_id is None:
+        return
+    _x_secret_tombstones[(uid, chat_id)] = time.monotonic() + X_SECRET_TOMBSTONE_TTL
+
+
+async def _delete_late_x_secret(event):
+    """يحذف أول سر يصل بعد إلغاء محاولة X، مربوطاً بالمرسل والمحادثة."""
+    now = time.monotonic()
+    for key, expires in list(_x_secret_tombstones.items()):
+        if expires <= now:
+            _x_secret_tombstones.pop(key, None)
+    key = (event.sender_id, event.chat_id)
+    # لا نستثني النصوص التي تبدأ /: كلمة مرور X نفسها قد تبدأ بشرطة مائلة.
+    # أول رسالة بعد الإلغاء/انتهاء المهلة تُعامل كسر محتمل fail-closed.
+    if key not in _x_secret_tombstones:
+        return False
+    _x_secret_tombstones.pop(key, None)
+    deleted = await _delete_secret_message(event)
+    await event.respond(
+        "🛑 أُهملت هذه الرسالة لأن عملية الإدخال السرية أُلغيت."
+        + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+    )
+    return True
+
+
+def _has_secret_tombstone(event):
+    now = time.monotonic()
+    for key, expires in list(_x_secret_tombstones.items()):
+        if expires <= now:
+            _x_secret_tombstones.pop(key, None)
+    return (event.sender_id, event.chat_id) in _x_secret_tombstones
+
+
+def _is_private_chat(event):
+    """يتحقق من أن الحدث داخل محادثة المستخدم الخاصة مع البوت."""
+    explicit = getattr(event, "is_private", None)
+    if explicit is not None:
+        return bool(explicit)
+    return (
+        getattr(event, "chat_id", None) is not None
+        and event.chat_id == getattr(event, "sender_id", None)
+    )
+
+
+def _x_challenge_key(event):
+    return event.sender_id, event.chat_id
+
+
+def _x_private_context_matches(event, st=None):
+    if not _is_private_chat(event):
+        return False
+    expected = (st or {}).get("x_chat_id")
+    return expected is None or expected == event.chat_id
+
+
+def _cancel_x_login(uid, *, cancel_task=True, remember_secret=True):
+    """يلغي محاولة X لمستخدم وينظف كل future/state مرتبطة بها."""
+    task = _x_login_tasks.get(uid)
+    # أثناء حذف password الحالية لا توجد رسالة متأخرة ننتظرها؛ مسار الحذف نفسه
+    # سيحذر عند الفشل. tombstone تخص السر الذي لم يصل بعد فقط.
+    if remember_secret and uid not in _x_login_deleting:
+        _remember_x_secret_tombstone(uid, state.get(uid))
+    if task is not None:
+        _x_login_cancelled.add(uid)
+    for key, future in list(_x_challenges.items()):
+        if key[0] != uid:
+            continue
+        _x_challenges.pop(key, None)
+        if not future.done():
+            future.cancel()
+    _clear_state(uid)
+    if (
+        cancel_task
+        and task is not None
+        and uid not in _x_login_deleting
+        and task is not asyncio.current_task()
+        and not task.done()
+    ):
+        task.cancel()
+    return task
+
+
+def _cancel_setup_for_navigation(uid):
+    """يلغي خطوة إدخال قبل الانتقال إلى لوحة/معرّفات أخرى."""
+    current = state.get(uid)
+    if (current or {}).get("action", "").startswith("x_") or uid in _x_login_tasks:
+        _cancel_x_login(uid)
+    elif current:
+        _remember_x_secret_tombstone(uid, current)
+        _clear_state(uid)
+
+
+def _navigation_context_matches(event, current=None):
+    """يمنع زر/أمر في مجموعة من إلغاء سر يجري إدخاله في الخاص."""
+    current = current or state.get(event.sender_id)
+    action = (current or {}).get("action", "")
+    if action.startswith("x_"):
+        return _x_private_context_matches(event, current)
+    if action == "claim_code":
+        return (
+            _is_private_chat(event)
+            and current.get("claim_chat_id") == event.chat_id
+        )
+    if event.sender_id in _x_login_tasks:
+        return _is_private_chat(event)
+    return True
+
+
+def _require_x_admin(uid):
+    if not S.is_admin(uid):
+        _cancel_x_login(uid)
+        raise PermissionError("X login administrator permission was revoked")
+
+
+async def _wait_for_x_challenge(event, kind, _prompt=""):
+    """يربط تحدي X برسالة الأدمن التالية في المحادثة الخاصة نفسها."""
+    if not _is_private_chat(event):
+        raise RuntimeError("X login challenges require a private Telegram chat")
+    uid = event.sender_id
+    _require_x_admin(uid)
+    key = _x_challenge_key(event)
+    previous = _x_challenges.get(key)
+    if previous is not None and not previous.done():
+        raise RuntimeError("يوجد تحدي X آخر قيد الانتظار")
+
+    future = asyncio.get_running_loop().create_future()
+    _x_challenges[key] = future
+    _set_state(uid, {
+        "action": "x_auth_code",
+        "x_challenge_kind": kind,
+        "x_chat_id": event.chat_id,
+    })
+    if kind == "two_factor":
+        text = (
+            "🔐 افتح تطبيق Authenticator وأرسل **الرمز الحالي من 6 أرقام**.\n"
+            "سأحذف الرسالة فوراً، والرمز لا يُحفظ. تنتهي المهلة بعد 3 دقائق."
+        )
+    else:
+        text = (
+            "📩 طلب X تحققاً إضافياً. أرسل القيمة التي يطلبها الآن "
+            "(قد تكون رمزاً أو البريد/الهاتف).\n"
+            "سأحذف الرسالة فوراً ولن أخزنها. تنتهي المهلة بعد 3 دقائق."
+        )
+    try:
+        await event.respond(text + "\nللإلغاء اضغط زر «🛑 إلغاء» أسفل خانة الكتابة.")
+        try:
+            response = await asyncio.wait_for(future, timeout=X_CHALLENGE_TIMEOUT)
+        except asyncio.TimeoutError:
+            _remember_x_secret_tombstone(uid, state.get(uid))
+            raise
+        _require_x_admin(uid)
+        return response
+    finally:
+        if _x_challenges.get(key) is future:
+            _x_challenges.pop(key, None)
+        current = state.get(uid)
+        if current and current.get("action") == "x_auth_code":
+            _clear_state(uid)
+
+
+async def _submit_x_challenge_code(event, st, raw):
+    """يسلّم رمزاً مؤقتاً لمحاولة X دون تسجيله أو تخزينه."""
+    uid = event.sender_id
+    context_ok = _x_private_context_matches(event, st)
+    deleted = await _delete_secret_message(event)
+    if not context_ok:
+        await event.respond(
+            "🔒 لم أستخدم هذه الرسالة. أرسل الرمز في المحادثة الخاصة الأصلية مع البوت."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
+        return
+
+    key = _x_challenge_key(event)
+    future = _x_challenges.get(key)
+    if not deleted:
+        if future is not None and not future.done():
+            future.cancel()
+        _x_challenges.pop(key, None)
+        _clear_state(uid)
+        await event.respond(
+            "❌ لم أستطع حذف رسالة الرمز بأمان، فألغيت محاولة دخول X. "
+            "احذف الرسالة يدوياً ثم ابدأ مجدداً."
+        )
+        return
+    if future is None or future.done():
+        _clear_state(uid)
+        await event.respond("⌛ انتهت محاولة تسجيل X. ابدأها من لوحة التحكم مجدداً.")
+        return
+
+    kind = st.get("x_challenge_kind")
+    if kind == "two_factor":
+        code = re.sub(r"[\s-]+", "", raw)
+        valid = bool(re.fullmatch(r"\d{6}", code))
+        hint = "رمز Authenticator يجب أن يكون 6 أرقام. افتح التطبيق وأرسل الرمز الحالي."
+    else:
+        code = raw.strip()
+        # LoginAcid في X مدخل نصي عام وقد يطلب بريداً أو هاتفاً بتنسيق محلي؛
+        # لا نفرض صيغة أضيق من X، ونمنع فقط الفراغ/محارف التحكم/الحجم المفرط.
+        valid = bool(code) and len(code) <= 254 and not any(
+            ord(char) < 32 or ord(char) == 127 for char in code
+        )
+        hint = "قيمة التحقق غير صالحة. أرسل الرمز أو البريد/الهاتف كما يطلبه X."
+    if not valid:
+        await event.respond(f"❌ {hint}")
+        return
+
+    future.set_result(code)
+    await event.respond("⏳ جاري التحقق من الرمز…")
 
 
 _SAFE_EXT = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
@@ -556,6 +814,106 @@ async def _send_for_review(item_id, refresh=False):
 
 
 # ============ لوحة التحكم (الأزرار) ============
+def _command_keyboard(*, claim=False):
+    """لوحة Reply Keyboard ثابتة تظهر تحت خانة الكتابة في المحادثة الخاصة."""
+    primary = BTN_CLAIM if claim else BTN_PANEL
+    options = {
+        "resize": True,
+        "persistent": True,
+        "placeholder": "اختر أمراً",
+    }
+    return [
+        [Button.text(primary, **options), Button.text(BTN_ID, **options)],
+        [Button.text(BTN_CANCEL, **options)],
+    ]
+
+
+def _keyboard_versions():
+    raw = S.get("reply_keyboard_versions") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _is_reserved_command(text):
+    command = (text or "").split(maxsplit=1)[0].split("@", 1)[0].lower()
+    return command in _RESERVED_COMMANDS
+
+
+def _remember_keyboard_version(uid):
+    versions = _keyboard_versions()
+    key = str(uid)
+    if versions.get(key) == REPLY_KEYBOARD_VERSION:
+        return
+    versions[key] = REPLY_KEYBOARD_VERSION
+    S.set("reply_keyboard_versions", versions)
+
+
+def _forget_keyboard_version(uid):
+    versions = _keyboard_versions()
+    if versions.pop(str(uid), None) is not None:
+        S.set("reply_keyboard_versions", versions)
+
+
+async def _send_command_keyboard(event, *, claim=False):
+    if not _is_private_chat(event):
+        return False
+    await event.respond(
+        "اختر من الأزرار أسفل خانة الكتابة:",
+        buttons=_command_keyboard(claim=claim),
+    )
+    if not claim and S.is_admin(event.sender_id):
+        try:
+            _remember_keyboard_version(event.sender_id)
+        except OSError as exc:
+            log.warning("أُرسلت لوحة أوامر Telegram لكن تعذّر حفظ إصدارها: %s", exc)
+    return True
+
+
+async def _offer_command_keyboard(uid):
+    """يرسل اللوحة مرة واحدة للأدمن بعد تشغيل البوت، بأفضل جهد."""
+    if _keyboard_versions().get(str(uid)) == REPLY_KEYBOARD_VERSION:
+        return False
+    try:
+        await _tg_call(
+            bot.send_message,
+            uid,
+            "⌨️ أصبحت أوامر البوت أزراراً ثابتة أسفل خانة الكتابة:",
+            buttons=_command_keyboard(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("تعذّر إرسال لوحة أوامر Telegram للأدمن %s: %s", uid, exc)
+        return False
+    try:
+        _remember_keyboard_version(uid)
+    except OSError as exc:
+        # الرسالة وصلت بالفعل؛ فشل الحفظ يعني فقط أنها قد تُعرض مجدداً بعد restart.
+        log.warning("أُرسلت لوحة أوامر Telegram لكن تعذّر حفظ إصدارها: %s", exc)
+    return True
+
+
+async def _remove_command_keyboard(uid):
+    """يخفي اللوحة عند سحب صلاحية الأدمن ويتيح إعادة إرسالها إن أُعيد لاحقاً."""
+    try:
+        await _tg_call(
+            bot.send_message,
+            uid,
+            "🔒 سُحبت صلاحية إدارة البوت.",
+            buttons=Button.clear(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("تعذّر إخفاء لوحة أوامر Telegram للأدمن السابق %s: %s", uid, exc)
+    try:
+        _forget_keyboard_version(uid)
+    except OSError as exc:
+        log.warning("تعذّر نسيان إصدار لوحة الأدمن السابق %s: %s", uid, exc)
+
+
+async def _offer_command_keyboards(uids):
+    """مهمة خلفية؛ FloodWait هنا لا يؤخر استعادة outbox أو تشغيل المصادر."""
+    if not uids:
+        return
+    await asyncio.gather(*(_offer_command_keyboard(uid) for uid in uids))
+
+
 def _panel_markup():
     login = "✅" if S.get("user_phone") else "❌"
     fb = "✅" if S.facebook_ready() else "❌"
@@ -582,43 +940,71 @@ async def _show_panel(event):
     await event.respond("⚙️ لوحة التحكم:", buttons=_panel_markup())
 
 
-@bot.on(events.NewMessage(pattern=r"^/(panel|start)"))
 async def cmd_panel(event):
     uid = event.sender_id
+    current = state.get(uid)
+    if (current or uid in _x_login_tasks) and not _navigation_context_matches(
+        event, current
+    ):
+        await event.respond("🔒 أكمل أو ألغِ العملية من محادثة البوت الخاصة الأصلية.")
+        return
+    _cancel_setup_for_navigation(uid)
     # أول شخص يطالب بالملكية عبر رمز يظهر في سجل الـ Raspberry
     if not S.get("owner_id"):
+        if not _is_private_chat(event):
+            await event.respond("🔒 افتح محادثة البوت الخاصة واضغط زر تفعيل الملكية.")
+            return
         await event.respond(
-            "👋 أهلاً! لتصبح المالك، أرسل:\n`/claim الرمز`\n"
-            "الرمز يظهر في سجل التشغيل على جهاز Raspberry."
+            "👋 أهلاً! اضغط «🔑 تفعيل الملكية»، ثم أرسل الرمز الذي يظهر "
+            "في سجل التشغيل على جهاز Raspberry.",
+            buttons=_command_keyboard(claim=True),
         )
         return
     if not S.is_admin(uid):
-        await event.respond("هذا البوت خاص. لست ضمن الأدمنين.")
+        await event.respond(
+            "هذا البوت خاص. لست ضمن الأدمنين.",
+            buttons=Button.clear() if _is_private_chat(event) else None,
+        )
         return
+    await _send_command_keyboard(event)
     await _show_panel(event)
 
 
-@bot.on(events.NewMessage(pattern=r"^/claim(?:\s+(\S+))?"))
-async def cmd_claim(event):
+@bot.on(events.NewMessage(pattern=r"^/(?:panel|start)(?:@\w+)?$"))
+async def on_panel_command(event):
+    await cmd_panel(event)
+    raise events.StopPropagation
+
+
+async def _attempt_claim(event, code):
     """
-    الملكية = كل الأسرار (توكن فيسبوك، كلمات مرور X). رمز من ستة أرقام بلا حد
-    للمحاولات كان قابلاً للتخمين، فصار رمزاً طويلاً مع سقف محاولات.
+    الملكية = كل الأسرار (توكن فيسبوك، كلمات مرور X). الرمز طويل وعشوائي
+    وله سقف محاولات حتى لا يكون قابلاً للتخمين.
     """
     global _claim_code, _claim_attempts
     if S.get("owner_id") or not _claim_code:
-        return
+        return False
     if _claim_attempts >= MAX_CLAIM_ATTEMPTS:
         await event.respond("🚫 تجاوزت عدد المحاولات. أعد تشغيل البوت لتوليد رمز جديد.")
-        return
+        return False
 
-    code = (event.pattern_match.group(1) or "").strip()
+    code = (code or "").strip()
     if code and secrets.compare_digest(code, _claim_code):
         S.set("owner_id", event.sender_id)
         S.add_admin(event.sender_id)
         _claim_code = None
-        await event.respond("✅ أصبحت المالك والأدمن. أرسل /panel للمتابعة.")
+        _clear_state(event.sender_id)
+        await event.respond(
+            "✅ أصبحت المالك والأدمن. الأوامر الآن أزرار أسفل خانة الكتابة.",
+            buttons=_command_keyboard(),
+        )
+        try:
+            _remember_keyboard_version(event.sender_id)
+        except OSError as exc:
+            log.warning("تعذّر حفظ إصدار لوحة الأوامر بعد تفعيل الملكية: %s", exc)
+        await _show_panel(event)
         log.info("تم تعيين المالك: %s", event.sender_id)
-        return
+        return True
 
     _claim_attempts += 1
     left = MAX_CLAIM_ATTEMPTS - _claim_attempts
@@ -628,11 +1014,212 @@ async def cmd_claim(event):
         await event.respond("🚫 تجاوزت عدد المحاولات. أعد تشغيل البوت لتوليد رمز جديد.")
     else:
         await event.respond(f"❌ الرمز غير صحيح. المحاولات المتبقية: {left}")
+    return False
 
 
-@bot.on(events.NewMessage(pattern=r"^/id"))
+async def cmd_claim(event):
+    """مسار توافق قديم؛ زر تفعيل الملكية هو المسار الظاهر للمستخدم."""
+    raw = event.text or ""
+    parts = raw.split(maxsplit=1)
+    tail = parts[1] if len(parts) == 2 else ""
+    code_parts = tail.split()
+    code = code_parts[0] if len(code_parts) == 1 else ""
+    if S.get("owner_id") or not _claim_code:
+        return
+    if not _is_private_chat(event):
+        deleted = await _delete_secret_message(event) if tail else True
+        await event.respond(
+            "🔒 أُهمل رمز الملكية؛ أرسله في محادثة البوت الخاصة فقط."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
+        return
+    if tail and not code:
+        deleted = await _delete_secret_message(event)
+        await event.respond(
+            "❌ صيغة رمز الملكية غير صحيحة. اضغط «🔑 تفعيل الملكية» ثم أرسل "
+            "الرمز وحده في الرسالة التالية."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
+        return
+    if not code:
+        await event.respond(
+            "اضغط «🔑 تفعيل الملكية» ثم أرسل الرمز الظاهر في سجل Raspberry."
+        )
+        return
+
+    # احجز المحاولة قبل حذف الرسالة؛ زر الإلغاء/اللوحة يستطيع إبطالها أثناء
+    # Telegram RPC، ثم يفشل فحص الهوية أدناه ولا تُفعّل ملكية قديمة.
+    _set_state(event.sender_id, {
+        "action": "claim_code",
+        "claim_chat_id": event.chat_id,
+    })
+    attempt = state[event.sender_id]
+    deleted = await _delete_secret_message(event)
+    if not deleted:
+        if state.get(event.sender_id) is attempt:
+            _clear_state(event.sender_id)
+        await event.respond(
+            "❌ لم أستطع حذف رسالة رمز الملكية بأمان. احذفها يدوياً "
+            "واستخدم زر «🔑 تفعيل الملكية» ثم حاول مجدداً."
+        )
+        return
+    if state.get(event.sender_id) is not attempt:
+        return
+    await _attempt_claim(event, code)
+
+
+@bot.on(events.NewMessage(pattern=r"^/claim(?:@\w+)?(?:\s|$)"))
+async def on_claim_command(event):
+    await cmd_claim(event)
+    raise events.StopPropagation
+
+
 async def cmd_id(event):
-    await event.respond(f"chat id: `{event.chat_id}`\nyour id: `{event.sender_id}`")
+    current = state.get(event.sender_id)
+    if (
+        current or event.sender_id in _x_login_tasks
+    ) and not _navigation_context_matches(event, current):
+        await event.respond("🔒 استخدم زر المعرّف في محادثة البوت الخاصة الأصلية.")
+        return
+    _cancel_setup_for_navigation(event.sender_id)
+    buttons = None
+    if _is_private_chat(event):
+        if S.is_admin(event.sender_id):
+            buttons = _command_keyboard()
+        elif not S.get("owner_id"):
+            buttons = _command_keyboard(claim=True)
+        else:
+            buttons = Button.clear()
+    await event.respond(
+        f"معرّف المحادثة: `{event.chat_id}`\nمعرّفك: `{event.sender_id}`",
+        buttons=buttons,
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/id(?:@\w+)?$"))
+async def on_id_command(event):
+    await cmd_id(event)
+    raise events.StopPropagation
+
+
+async def cmd_cancel(event):
+    """يلغي محادثة الإعداد ومحاولة تسجيل X الخاصة بالمرسل فقط."""
+    uid = event.sender_id
+    # من سُحبت صلاحيته يظل مسموحاً له بتنظيف محاولته المعلّقة فقط.
+    current = state.get(uid)
+    if (
+        not S.is_admin(uid)
+        and uid not in _x_login_tasks
+        and (current or {}).get("action") != "claim_code"
+    ):
+        return
+    had_state = uid in state
+    task = _x_login_tasks.get(uid)
+    if (current or task is not None) and not _navigation_context_matches(
+        event, current
+    ):
+        await event.respond("🔒 اضغط «🛑 إلغاء» في محادثة البوت الخاصة الأصلية.")
+        return
+    _cancel_x_login(uid)
+    await event.respond(
+        "🛑 أُلغيت محاولة تسجيل X." if task is not None
+        else ("🛑 أُلغيت عملية الإعداد." if had_state else "لا توجد عملية معلّقة.")
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/cancel(?:@\w+)?$"))
+async def on_cancel_command(event):
+    await cmd_cancel(event)
+    raise events.StopPropagation
+
+
+async def _open_reply_panel(event):
+    """يفتح اللوحة من Reply Keyboard دون إعادة إرسال لوحة المفاتيح نفسها."""
+    if not S.get("owner_id"):
+        if not _is_private_chat(event):
+            await event.respond("🔒 افتح محادثة البوت الخاصة لتفعيل الملكية.")
+            return
+        await event.respond(
+            "اضغط «🔑 تفعيل الملكية» أولاً.",
+            buttons=_command_keyboard(claim=True),
+        )
+        return
+    if not S.is_admin(event.sender_id):
+        await event.respond(
+            "هذا البوت خاص. لست ضمن الأدمنين.",
+            buttons=Button.clear() if _is_private_chat(event) else None,
+        )
+        return
+    await _show_panel(event)
+
+
+async def _start_claim_from_button(event):
+    if S.get("owner_id"):
+        await _open_reply_panel(event)
+        return
+    if not _is_private_chat(event):
+        await event.respond("🔒 فعّل الملكية داخل محادثة البوت الخاصة فقط.")
+        return
+    if not _claim_code:
+        await event.respond("⌛ لا يوجد رمز تفعيل صالح الآن. أعد تشغيل البوت لتوليد رمز جديد.")
+        return
+    _clear_state(event.sender_id)
+    _set_state(event.sender_id, {
+        "action": "claim_code",
+        "claim_chat_id": event.chat_id,
+    })
+    await event.respond(
+        "🔑 أرسل الآن رمز تفعيل الملكية الظاهر في سجل تشغيل Raspberry. "
+        "سأحذف رسالة الرمز فوراً."
+    )
+
+
+async def _handle_reply_button(event, action, st=None, *, already_deleted=False):
+    """يوجّه ضغطات Reply Keyboard قبل أن تصل إلى حقول كلمات المرور/الرموز."""
+    uid = event.sender_id
+    current = st or state.get(uid)
+    sensitive = (current or {}).get("action") in {
+        "x_email", "x_pass", "x_auth_code", "claim_code",
+    }
+    should_delete = sensitive or _has_secret_tombstone(event)
+
+    # زر وصل من مجموعة لا يملك حق إلغاء محاولة سرية مربوطة بمحادثة البوت
+    # الخاصة. نحذف نص الزر احتياطياً، لكن لا نغيّر state/task الأصلية.
+    if (current or uid in _x_login_tasks) and not _navigation_context_matches(
+        event, current
+    ):
+        deleted = True
+        if should_delete and not already_deleted:
+            deleted = await _delete_secret_message(event)
+        await event.respond(
+            "🔒 استخدم أزرار الأوامر في محادثة البوت الخاصة الأصلية."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
+        return
+
+    # ثبّت الإلغاء قبل أول await؛ فلا يستطيع رمز/كلمة مرور متزامنة إكمال
+    # الملكية أو تسجيل X بينما Telegram يتأخر في حذف رسالة الزر.
+    if action == "cancel":
+        await cmd_cancel(event)
+    elif current or uid in _x_login_tasks:
+        _cancel_setup_for_navigation(uid)
+
+    if should_delete and not already_deleted:
+        deleted = await _delete_secret_message(event)
+        if not deleted:
+            await event.respond(
+                "⚠️ تعذّر حذف الرسالة من Telegram. احذفها يدوياً فوراً."
+            )
+
+    if action == "cancel":
+        return
+
+    if action == "panel":
+        await _open_reply_panel(event)
+    elif action == "id":
+        await cmd_id(event)
+    elif action == "claim":
+        await _start_claim_from_button(event)
 
 
 # ============ أزرار اللوحة ============
@@ -763,7 +1350,16 @@ async def on_xlogin(event):
         return
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
-        _set_state(event.sender_id, {"action": "x_user"})
+        if not _is_private_chat(event):
+            await event.answer(
+                "افتح محادثة البوت الخاصة واضغط «⚙️ لوحة التحكم» لإضافة حساب X بأمان.",
+                alert=True,
+            )
+            return
+        _set_state(event.sender_id, {
+            "action": "x_user",
+            "x_chat_id": event.chat_id,
+        })
         await event.respond(
             "🐦 استخدم حساب X ثانوياً.\nأرسل **اسم المستخدم** (بدون @):"
         )
@@ -778,7 +1374,8 @@ async def on_xlogin(event):
         xreader.invalidate()
         await event.respond(
             "♻️ أُعيد تفعيل كل حسابات الدخول.\n"
-            "الكوكيز المنتهية تُحذف تلقائياً ليعاد تسجيل الدخول بكلمة المرور."
+            "إذا انتهت جلسة أحدها فأعد إضافته؛ سيطلب البوت رمز Authenticator "
+            "داخل Telegram عند الحاجة."
         )
     await event.answer()
 
@@ -893,7 +1490,7 @@ async def on_adm(event):
     action = event.data.decode().split(":", 1)[1]
     if action == "add":
         _set_state(event.sender_id, {"action": "add_admin"})
-        await event.respond("أرسل المعرّف الرقمي للأدمن الجديد (يعرفه بأمر /id):")
+        await event.respond("أرسل المعرّف الرقمي للأدمن الجديد (يجده من زر «🆔 معرّفي»):")
     elif action == "del":
         _set_state(event.sender_id, {"action": "del_admin"})
         await event.respond("أرسل المعرّف الرقمي للأدمن المراد حذفه:")
@@ -1139,7 +1736,7 @@ async def on_publish_resolution(event):
 
 async def _publish(event, item_id, include_media):
     if not S.facebook_ready():
-        await event.answer("أعدّ فيسبوك أولاً من /panel.", alert=True)
+        await event.answer("أعدّ فيسبوك أولاً من زر «⚙️ لوحة التحكم».", alert=True)
         return
     item = PENDING.get(item_id)
     blocked = _publish_block_message(item_id, item)
@@ -1218,7 +1815,7 @@ async def _publish(event, item_id, include_media):
                 )
             await event.respond(
                 f"🔑 مشكلة في توكن فيسبوك:\n{e}\n\n"
-                "المنشور محفوظ — أعِد ضبط 📘 فيسبوك من /panel ثم اضغط نشر مجدداً."
+                "المنشور محفوظ — أعِد ضبط 📘 فيسبوك من «⚙️ لوحة التحكم» ثم اضغط نشر مجدداً."
             )
             await _notify_owner("🔑 توكن فيسبوك لم يعد صالحاً — النشر متوقف حتى تحديثه.")
             return
@@ -1277,17 +1874,102 @@ async def _publish(event, item_id, include_media):
 @bot.on(events.NewMessage)
 async def on_text(event):
     uid = event.sender_id
-    st = _get_state(uid)
-    if not st or not event.text or event.text.startswith("/"):
+    if not event.text:
         return
+    reply_action = _REPLY_ACTIONS.get(event.text)
+    if reply_action:
+        await _handle_reply_button(event, reply_action, _get_state(uid))
+        return
+
+    # معالجات الأوامر الخاصة ترفع StopPropagation. هذا الحاجز الإضافي يمنع
+    # رسالة الأمر نفسها من استهلاك tombstone لو استُدعي on_text يدوياً/بترتيب مختلف.
+    if _is_reserved_command(event.text):
+        return
+    if await _delete_late_x_secret(event):
+        return
+    st = _get_state(uid)
+    # _get_state قد يحوّل state منتهية الآن إلى tombstone؛ احذف نفس الرسالة
+    # المتأخرة بدلاً من انتظار رسالة ثانية.
+    if not st:
+        await _delete_late_x_secret(event)
+        return
+    # كلمة مرور X قد تبدأ بشرطة مائلة، لكن أسماء أوامر البوت تبقى محجوزة كيلا
+    # يعمل handler الأمر ثم تُرسل الرسالة نفسها إلى X ككلمة مرور أيضاً.
+    if event.text.startswith("/"):
+        if st.get("action") == "x_pass" and not _is_reserved_command(event.text):
+            pass
+        else:
+            if _is_reserved_command(event.text) and not event.text.lower().startswith(
+                "/cancel"
+            ):
+                _cancel_setup_for_navigation(uid)
+            return
+    action = st["action"]
+    text = event.text.strip()
+
+    # تفعيل المالك يسبق فحص الأدمن لأن البوت لا يملك أي أدمن بعد. نربطه بنفس
+    # المحادثة الخاصة ونحذف الرمز من Telegram قبل فحصه.
+    if action == "claim_code":
+        if (
+            not _is_private_chat(event)
+            or st.get("claim_chat_id") != event.chat_id
+        ):
+            deleted = await _delete_secret_message(event)
+            await event.respond(
+                "🔒 أُهمل رمز التفعيل. أرسله في محادثة البوت الخاصة الأصلية."
+                + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+            )
+            return
+        deleted = await _delete_secret_message(event)
+        if not deleted:
+            _clear_state(uid)
+            await event.respond(
+                "❌ لم أستطع حذف رسالة الرمز بأمان. احذفها يدوياً، ثم اضغط "
+                "«🔑 تفعيل الملكية» وحاول مجدداً."
+            )
+            return
+        # قد يضغط المستخدم إلغاء/لوحة التحكم بينما Telegram يحذف رسالة الرمز.
+        # لا نستخدم snapshot قديمة بعد await؛ يجب أن تبقى نفس محاولة claim حية.
+        if state.get(uid) is not st:
+            return
+        claimed = await _attempt_claim(event, text)
+        if (
+            state.get(uid) is st
+            and not claimed
+            and _claim_code
+            and not S.get("owner_id")
+        ):
+            _set_state(uid, {
+                "action": "claim_code",
+                "claim_chat_id": event.chat_id,
+            })
+        elif state.get(uid) is st:
+            _clear_state(uid)
+        return
+
     # ⚠️ أمان: الصلاحية تُفحص عند فتح المحادثة فقط، فمن أُزيل من الأدمنين بعدها
     # كان بإمكانه إكمال خطوة معلّقة (تغيير توكن فيسبوك مثلاً). نعيد الفحص هنا.
     if not S.is_admin(uid):
-        _clear_state(uid)
+        if st.get("action") in {"x_email", "x_pass", "x_auth_code"}:
+            deleted = await _delete_secret_message(event)
+            if not deleted:
+                await event.respond("⚠️ احذف رسالة اعتماد X الظاهرة يدوياً فوراً.")
+        _cancel_x_login(uid, remember_secret=False)
         log.warning("أُهملت محادثة إعداد لمستخدم لم يعد أدمن: %s", uid)
         return
-    action = st["action"]
-    text = event.text.strip()
+    # كل خطوات اعتماد X تبدأ وتكتمل في المحادثة الخاصة نفسها. لو أرسل الأدمن
+    # كلمة المرور/الرمز في مجموعة بالخطأ نحاول حذفها ولا نسلّمها لمحاولة الدخول.
+    if action in {"x_user", "x_email", "x_pass", "x_auth_code"} and not (
+        _x_private_context_matches(event, st)
+    ):
+        deleted = True
+        if action in {"x_email", "x_pass", "x_auth_code"}:
+            deleted = await _delete_secret_message(event)
+        await event.respond(
+            "🔒 أكمل إعداد X في المحادثة الخاصة التي بدأت منها العملية."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
+        )
+        return
 
     if action == "login_phone":
         await _login_phone(event, text)
@@ -1321,26 +2003,52 @@ async def on_text(event):
         _clear_state(uid)
         await event.respond(f"🗑️ حُذف {removed} قناة." if removed else "لم أجد قناة مطابقة.")
     elif action == "x_user":
-        _set_state(uid, {"action": "x_email", "x_username": text.lstrip("@")})
+        _set_state(uid, {
+            "action": "x_email",
+            "x_username": text.lstrip("@"),
+            "x_chat_id": st.get("x_chat_id", event.chat_id),
+        })
         await event.respond("أرسل بريد الحساب الإلكتروني (أو أرسل `-` لتخطّيه):")
     elif action == "x_email":
         _set_state(uid, {
             "action": "x_pass",
             "x_username": st.get("x_username"),
             "x_email": None if text == "-" else text,
+            "x_chat_id": st.get("x_chat_id", event.chat_id),
         })
         await event.respond("أرسل **كلمة مرور** حساب X:")
     elif action == "x_pass":
-        await _save_x_login(event, st, text)
+        # كلمات المرور حساسة لحروف المسافة؛ لا نمرر النسخة المقتطعة أعلاه.
+        await _save_x_login(event, st, event.text)
+    elif action == "x_auth_code":
+        await _submit_x_challenge_code(event, st, text)
     elif action == "x_switch":
         await _switch_x_login(event, text)
     elif action == "x_login_del":
         _clear_state(uid)
-        removed = S.remove_x_login(text.lstrip("@"))
+        username = text.lstrip("@")
+        stored_username = next(
+            (
+                login["username"]
+                for login in S.x_logins()
+                if login["username"].lower() == username.lower()
+            ),
+            username,
+        )
+        removed = S.remove_x_login(username)
+        session_removed = True
         if removed:
-            xreader.invalidate()
+            session_removed = xreader.discard_session(stored_username)
         await event.respond(
-            f"🗑️ حُذف {removed} حساب دخول." if removed else "لم أجد الحساب."
+            (
+                f"🗑️ حُذف {removed} حساب دخول."
+                + (
+                    ""
+                    if session_removed
+                    else "\n⚠️ تعذّر حذف ملف الجلسة من القرص؛ افحص صلاحيات مجلد الحالة."
+                )
+            )
+            if removed else "لم أجد الحساب."
         )
     elif action == "x_add":
         await _add_x_account(event, text)
@@ -1358,14 +2066,20 @@ async def on_text(event):
         await event.respond("🗑️ حُذفت الكلمة." if removed else "لم أجد الكلمة.")
     elif action == "add_admin":
         if text.isdigit():
-            S.add_admin(int(text))
+            added_uid = int(text)
+            S.add_admin(added_uid)
             await event.respond(f"✅ أضيف الأدمن `{text}`")
+            await _offer_command_keyboard(added_uid)
         else:
             await event.respond("أرسل معرّفاً رقمياً صحيحاً.")
         _clear_state(uid)
     elif action == "del_admin":
         if text.isdigit():
-            S.remove_admin(int(text))
+            removed_uid = int(text)
+            S.remove_admin(removed_uid)
+            if not S.is_admin(removed_uid):
+                _cancel_x_login(removed_uid)
+                await _remove_command_keyboard(removed_uid)
             await event.respond(f"🗑️ حُذف الأدمن `{text}`")
         else:
             await event.respond("أرسل معرّفاً رقمياً صحيحاً.")
@@ -1400,24 +2114,133 @@ async def _save_fb_token(event, token):
 async def _save_x_login(event, st, password):
     username = st.get("x_username")
     email = st.get("x_email")
-    _clear_state(event.sender_id)
-    try:
-        await event.delete()  # حذف رسالة كلمة المرور للخصوصية
-    except Exception:  # noqa: BLE001
-        pass
-    S.add_x_login(username, email, password)
-    xreader.invalidate()
-    await event.respond("⏳ جاري تسجيل الدخول إلى X…")
-    try:
-        if await xreader.ensure_login():
-            await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
-        else:
-            await event.respond("❌ تعذّر الدخول بأي حساب. تحقق من البيانات.")
-    except Exception as e:  # noqa: BLE001
+    uid = event.sender_id
+    if not _x_private_context_matches(event, st):
+        deleted = await _delete_secret_message(event)
         await event.respond(
-            f"❌ فشل تسجيل الدخول إلى X: {e}\n"
-            "قد يطلب تأكيداً أمنياً؛ سجّل الدخول من المتصفح مرة ثم أعد المحاولة."
+            "🔒 أُهملت كلمة المرور؛ تسجيل X مسموح فقط في المحادثة الخاصة الأصلية."
+            + ("" if deleted else " احذف الرسالة الظاهرة يدوياً فوراً.")
         )
+        return
+
+    if not username or not password:
+        deleted = await _delete_secret_message(event)
+        _clear_state(uid)
+        if not deleted:
+            await event.respond("⚠️ احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        await event.respond("❌ اسم المستخدم وكلمة المرور مطلوبان.")
+        return
+
+    existing = _x_login_tasks.get(uid)
+    if existing is not None and not existing.done():
+        deleted = await _delete_secret_message(event)
+        if not deleted:
+            await event.respond("⚠️ احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        await event.respond("⏳ لديك محاولة تسجيل X جارية بالفعل. اضغط «🛑 إلغاء» لإلغائها.")
+        return
+    if any(
+        owner != uid and pending is not None and not pending.done()
+        for owner, pending in _x_login_tasks.items()
+    ):
+        # XReader عميل مشترك؛ محاولتان متزامنتان قد تخلطان cookies والحساب النشط.
+        deleted = await _delete_secret_message(event)
+        _clear_state(uid)
+        if not deleted:
+            await event.respond("⚠️ احذف رسالة كلمة المرور الظاهرة يدوياً فوراً.")
+        await event.respond("⏳ توجد محاولة تسجيل X أخرى جارية. حاول بعد انتهائها.")
+        return
+
+    # الحجز يحدث قبل أول await: يستطيع /cancel رؤية المحاولة حتى أثناء حذف السر.
+    task = asyncio.current_task()
+    _x_login_tasks[uid] = task
+    _x_login_cancelled.discard(uid)
+    _x_login_deleting.add(uid)
+    credentials = {"username": username, "email": email, "password": password}
+    password = None
+
+    async def challenge_handler(kind, prompt=""):
+        _require_x_admin(uid)
+        response = await _wait_for_x_challenge(event, kind, prompt)
+        _require_x_admin(uid)
+        return response
+
+    try:
+        try:
+            deleted = await _delete_secret_message(event)
+        finally:
+            _x_login_deleting.discard(uid)
+        _clear_state(uid)
+        # /cancel أثناء await الحذف لا يقطع عملية الحذف نفسها؛ يمنع الاتصال بـX
+        # فور اكتمالها، ثم ينظف finally القفل ونسخة كلمة المرور.
+        if uid in _x_login_cancelled:
+            if deleted:
+                return
+        if not deleted:
+            await event.respond(
+                "❌ لم أستطع حذف رسالة كلمة المرور بأمان، لذلك لم أستخدمها. "
+                "احذفها يدوياً ثم ابدأ إضافة الحساب مجدداً."
+            )
+            return
+        _require_x_admin(uid)
+        login_generation = xreader.invalidate()
+        await event.respond(
+            "⏳ جاري تسجيل الدخول إلى X… إذا طُلب تحقق إضافي سأطلب الرمز هنا."
+        )
+        _require_x_admin(uid)
+        if not xreader.is_generation_current(login_generation):
+            await event.respond("🛑 أُلغيت محاولة X لأن جلسة أحدث فُعّلت.")
+            return
+        ok = await xreader.login_interactive(credentials, challenge_handler)
+        if not ok:
+            await event.respond("❌ تعذّر تسجيل الدخول إلى X. تحقق من البيانات.")
+            return
+        if not S.is_admin(uid):
+            discarded = xreader.discard_session(username)
+            _cancel_x_login(uid, cancel_task=False)
+            if not discarded:
+                await _notify_owner(
+                    "⚠️ سُحبت صلاحية أدمن أثناء دخول X، لكن تعذّر حذف ملف "
+                    "الجلسة الجديدة. افحص مجلد الحالة واحذف جلسة الحساب يدوياً."
+                )
+            return
+        # لا نحفظ كلمة المرور إلا بعد اكتمال كلمة المرور + التحديات + فحص الجلسة.
+        try:
+            S.add_x_login(username, email, credentials["password"])
+        except OSError:
+            # لا نترك cookie لا يمكن الوصول إليها بعد restart إذا فشل settings.
+            discarded = xreader.discard_session(username)
+            await event.respond(
+                "❌ نجح تحقق X لكن تعذّر حفظ الإعدادات على القرص؛ "
+                + (
+                    "حُذفت الجلسة غير المثبتة."
+                    if discarded
+                    else "تعذّر أيضاً حذف ملف الجلسة، فافحص صلاحيات مجلد الحالة."
+                )
+            )
+            return
+        await event.respond(f"✅ تم الدخول. الحساب النشط: @{xreader.active}")
+    except asyncio.TimeoutError:
+        await event.respond("⌛ انتهت مهلة رمز X. ابدأ إضافة الحساب مجدداً.")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:  # noqa: BLE001
+        log.warning("فشل دخول X التفاعلي (%s)", type(e).__name__)
+        await event.respond(
+            "❌ فشل تسجيل الدخول إلى X. تحقق من اسم المستخدم والبريد وكلمة المرور، "
+            "ثم أعد المحاولة."
+        )
+    finally:
+        _x_login_deleting.discard(uid)
+        _x_login_cancelled.discard(uid)
+        credentials.clear()
+        if _x_login_tasks.get(uid) is task:
+            _x_login_tasks.pop(uid, None)
+        challenge = _x_challenges.pop(_x_challenge_key(event), None)
+        if challenge is not None and not challenge.done():
+            challenge.cancel()
+        current = state.get(uid)
+        if current and current.get("action") == "x_auth_code":
+            _clear_state(uid)
 
 
 async def _switch_x_login(event, text):
@@ -1430,10 +2253,11 @@ async def _switch_x_login(event, text):
         ok = await xreader.ensure_login()
         await event.respond(
             f"✅ الحساب النشط الآن: @{xreader.active}" if ok
-            else "❌ تعذّر الدخول بهذا الحساب."
+            else "❌ لا توجد جلسة X صالحة لهذا الحساب؛ أعد إضافته لتسجيل الدخول."
         )
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ فشل: {e}")
+        log.warning("فشل تبديل جلسة X (%s)", type(e).__name__)
+        await event.respond("❌ تعذّر تفعيل جلسة X. أعد إضافة الحساب إذا انتهت جلسته.")
 
 
 async def _apply_edit(event, st):
@@ -1668,13 +2492,15 @@ async def x_poller():
             if S.x_accounts() and S.get("review_chat_id"):
                 if await xreader.ensure_login():
                     _x_alerted = False
-                    active = xreader.active
                     for i, acc in enumerate(S.x_accounts()):
                         # تباعد عشوائي بسيط بين الحسابات (سلوك أقل آلية)
                         if i:
                             await asyncio.sleep(random.uniform(3, 10))
+                        session = xreader.capture_session()
+                        if session is None:
+                            break
                         try:
-                            for tw in await xreader.fetch_new(acc):
+                            for tw in await xreader.fetch_new(acc, session=session):
                                 if not await handle_x_tweet(acc, tw):
                                     log.warning(
                                         "توقفت معالجة @%s لأن إرسال المراجعة فشل؛ "
@@ -1683,9 +2509,9 @@ async def x_poller():
                                     )
                                     break
                         except Exception as e:  # noqa: BLE001
-                            if xreader.report_failure(e):
+                            if xreader.report_failure(e, session=session):
                                 await _notify_owner(
-                                    f"⚠️ حساب X @{active} تعذّر (قد يكون محظوراً). "
+                                    f"⚠️ حساب X @{session.username} تعذّر (قد يكون محظوراً). "
                                     "سأجرّب حساباً آخر في الدورة القادمة."
                                 )
                                 break
@@ -1693,8 +2519,9 @@ async def x_poller():
                 elif S.x_logins() and not _x_alerted:
                     _x_alerted = True
                     await _notify_owner(
-                        "🚫 كل حسابات دخول X محظورة/فاشلة.\n"
-                        "أضف حساباً جديداً من /panel ← 🐦 حسابات دخول X."
+                        "🔐 لا توجد جلسة X صالحة حالياً.\n"
+                        "أعد إضافة حساب الدخول من «⚙️ لوحة التحكم» ← 🐦 حسابات دخول X؛ "
+                        "سيطلب البوت رمز Authenticator عند الحاجة."
                     )
         except Exception as e:  # noqa: BLE001
             log.warning("دورة X: %s", e)
@@ -1729,6 +2556,14 @@ async def housekeeping():
 async def main():
     global _claim_code
     await bot.start(bot_token=S.get("bot_token"))
+
+    # بعد ترقية نسخة قديمة، تصل لوحة الأزرار للأدمنين تلقائياً مرة واحدة؛
+    # لا يحتاج المستخدم إلى كتابة /start أو /panel كي تظهر له.
+    owner = S.get("owner_id")
+    keyboard_recipients = {
+        uid for uid in ([owner] + (S.get("admin_ids") or []))
+        if isinstance(uid, int)
+    }
     await user.connect()
     _harden_state_permissions()   # ملفات الجلسة تُنشأ الآن — قيّدها فوراً
 
@@ -1740,7 +2575,10 @@ async def main():
     if not S.get("owner_id"):
         _claim_code = secrets.token_urlsafe(9)
         log.warning("=" * 56)
-        log.warning("لا يوجد مالك بعد. أرسل للبوت في تلغرام:  /claim %s", _claim_code)
+        log.warning(
+            "لا يوجد مالك بعد. اضغط في البوت «🔑 تفعيل الملكية» ثم أرسل الرمز: %s",
+            _claim_code,
+        )
         log.warning("=" * 56)
 
     _rebuild_ids()
@@ -1761,6 +2599,7 @@ async def main():
         bot.run_until_disconnected(),
         x_poller(),
         housekeeping(),
+        _offer_command_keyboards(keyboard_recipients),
     )
 
 

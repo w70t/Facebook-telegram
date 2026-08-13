@@ -9,6 +9,7 @@ import pytest
 from store import PendingStore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(HERE, "_smoke_security.py")
 
 
@@ -26,6 +27,15 @@ def test_main_security_helpers(tmp_path):
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "SECURITY OK" in result.stdout
+
+
+def test_crash_leftover_x_cookie_temp_is_gitignored():
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", ".x-cookies-deadbeef.tmp"],
+        cwd=ROOT,
+        check=False,
+    )
+    assert result.returncode == 0
 
 
 # --- سقف المنشورات المعلّقة (إغراق القرص) ---
@@ -94,13 +104,15 @@ def test_pending_file_is_owner_only(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="أوضاع Unix 0600 لا تنطبق على Windows")
-def test_touch_private_creates_restricted_file(tmp_path):
-    from twitter import _touch_private
+def test_atomic_cookie_save_creates_restricted_file(tmp_path):
+    from twitter import _save_cookies_atomic
+
+    class Client:
+        @staticmethod
+        def save_cookies(path):
+            with open(path, "w", encoding="utf-8") as cookie_file:
+                cookie_file.write('{"cookie": "value"}')
 
     path = str(tmp_path / "x_cookies_acct.json")
-    _touch_private(path)
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    # الكتابة اللاحقة بـ open(...,"w") تقتطع الملف ولا تغيّر صلاحياته
-    with open(path, "w", encoding="utf-8") as f:
-        f.write('{"cookie": "value"}')
+    _save_cookies_atomic(Client(), path)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
